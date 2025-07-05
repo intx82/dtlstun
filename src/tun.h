@@ -1,19 +1,19 @@
 #ifndef __TUN_H__
 #define __TUN_H__
 
-#include "io.h"
-
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <linux/if.h>
 #include <linux/if_tun.h>
 #include <netinet/in.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -23,16 +23,19 @@
 #include <thread>
 #include <vector>
 
+#include "io.h"
+
 class tun_if_t : public io_t
 {
-public:
+   public:
     tun_if_t(std::string name,
              receive_callback rx_cb,
-             std::uint16_t mtu = 1440, // 1536 - 14 - 20 - 8 - 13 - ... = ~1440
+             std::uint16_t mtu = 1440,  // 1536 - 14 - 20 - 8 - 13 - ... = ~1440
              std::string ip = "",
              uint8_t cidr = 24,
              unsigned queues = 1)
         : rx_cb_(std::move(rx_cb)),
+          ip_(ip),
           mtu_(mtu),
           running_(true)
     {
@@ -43,7 +46,7 @@ public:
         fds_.reserve(queues);
         rx_thr_.reserve(queues);
 
-        int flags = IFF_TUN | IFF_NO_PI | (queues > 1 ? IFF_MULTI_QUEUE : 0);
+        int flags = IFF_TUN | IFF_NO_PI | IFF_BROADCAST | (queues > 1 ? IFF_MULTI_QUEUE : 0);
 
         for (unsigned q = 0; q < queues; ++q) {
             std::string tmp = name;
@@ -56,8 +59,8 @@ public:
         }
 
         buf_len_ = mtu_ + 100;
-        if (!ip.empty()) {
-            configure_ipv4(if_name_, ip, cidr);
+        if (!ip_.empty()) {
+            configure_ipv4(if_name_, ip_, cidr);
         } else {
             bring_up(if_name_);
         }
@@ -72,6 +75,22 @@ public:
         }
     }
 
+    void send_dummy()
+    {
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, if_name_.c_str(), if_name_.length());
+        int yes = 1; setsockopt(s, SOL_SOCKET, SO_BROADCAST, &yes, sizeof yes);
+
+        uint8_t pkt[] = {0xde, 0xad, 0xca, 0xfe};
+        struct sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_addr.s_addr = 0xffffffff;
+        dst.sin_port = 1;
+
+        sendto(s, pkt, sizeof(pkt), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+        ::close(s);
+    }
+
     ~tun_if_t() override { stop(); }
 
     void stop()
@@ -81,8 +100,11 @@ public:
         }
 
         for (int fd : fds_) {
+            send_dummy();
             ::shutdown(fd, SHUT_RD);
+            ::close(fd);
         }
+
         for (auto &t : rx_thr_) {
             if (t.joinable()) {
                 t.join();
@@ -93,11 +115,12 @@ public:
             ::close(fd);
         }
         fds_.clear();
+        std::cerr << "TUN layer exiting..\n";
     }
 
     void write(const endpoint_t &, const uint8_t *data, size_t len) override
     {
-        int fd = fds_[tx_seq_.fetch_add(1) % fds_.size()]; // round-robin
+        int fd = fds_[tx_seq_.fetch_add(1) % fds_.size()];
         ssize_t n = ::write(fd, data, len);
         if (n < 0) {
             std::perror("tun_if_t: write");
@@ -162,7 +185,7 @@ public:
     const std::string &if_name() const { return if_name_; }
     std::uint16_t current_mtu() const { return mtu_; }
 
-private:
+   private:
     static int tun_alloc(std::string &dev, int flags, std::uint16_t mtu)
     {
         int fd = ::open("/dev/net/tun", O_RDWR | O_CLOEXEC);
@@ -179,8 +202,9 @@ private:
             ::close(fd);
             return -1;
         }
+
         int sndbuf = mtu + 100;
-        ioctl(fd, TUNSETSNDBUF, &sndbuf);
+        ::ioctl(fd, TUNSETSNDBUF, &sndbuf);
 
         dev = ifr.ifr_name;
         int s = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -209,6 +233,7 @@ private:
         while (running_) {
             ssize_t n = ::read(fd, buf.data(), buf.size());
             if (n < 0) {
+                std::cerr << __FILE__ << ":" << __LINE__ << "\n";
                 if (errno == EINTR) {
                     continue;
                 }
@@ -228,11 +253,10 @@ private:
     }
 
     std::string if_name_;
-    std::string ip_;
     std::vector<int> fds_;
     std::vector<std::thread> rx_thr_;
     receive_callback rx_cb_;
-
+    std::string ip_;
     std::uint16_t mtu_;
     size_t buf_len_;
     std::atomic_uint64_t tx_seq_{0};

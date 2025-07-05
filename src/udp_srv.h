@@ -68,13 +68,14 @@ public:
         });
     }
 
-    ~udp_server_t(void)
+    ~udp_server_t(void) override
     {
         stop();
     }
 
     void stop(void)
     {
+        std::cerr << "UDP layer exiting..\n";
         if (!running_.exchange(false)) {
             return;
         }
@@ -82,8 +83,10 @@ public:
         shutdown(sock_, SHUT_RDWR);
         close(sock_);
         close(efd_);
-        if (thr_.joinable())
+
+        if (thr_.joinable()) {
             thr_.join();
+        }
     }
 
     /* non-copyable, movable */

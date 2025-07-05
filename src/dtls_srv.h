@@ -49,6 +49,22 @@ public:
 
     ~dtls_server_t() override
     {
+        std::cerr << "DTLS-Server exiting..\n";
+
+        for (auto &kv : sessions_) {
+            endpoint_t ep = parse_key(kv.first);
+
+            session &s = *kv.second;
+            if (!s.hs_done) {
+                continue;
+            }
+
+            SSL_shutdown(s.ssl);
+            pump_out_bio(s, ep);
+        }
+
+        usleep(250000); // to receive encrypted alert from clients
+
         running_ = false;
         uint64_t one = 1;
         ::write(wakeup_fd_, &one, sizeof(one));
