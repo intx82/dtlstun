@@ -7,6 +7,8 @@ src = [ 'main.cpp', 'arg_parse.cpp']
 inc = include_directories('.')
 
 add_project_arguments('-g3',  language : 'cpp')
+add_project_arguments('-g3',  language : 'c')
+
 executable('dtlstun',
            src,
            include_directories : inc,

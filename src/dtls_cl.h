@@ -71,9 +71,23 @@ public:
 
     ~dtls_client_t() override
     {
-        running_ = false;
-        uint64_t one = 1;
-        ::write(timer_fd_, &one, sizeof(one));
+        stop();
+    }
+
+    void stop()
+    {
+        std::cerr << "DTLS-Client exiting.. Sending Encrypted-Alert to the server\n";
+        SSL_shutdown(ssl_);
+        pump_out();
+
+        running_.exchange(false);
+        usleep(250000); // just to receive server-side encrypted alert
+
+        itimerspec dis{};
+        dis.it_value.tv_sec = 0;
+        dis.it_value.tv_nsec = 250'000'000LL;
+        timerfd_settime(timer_fd_, 0, &dis, nullptr);
+
         if (thr_.joinable()) {
             thr_.join();
         }
@@ -153,7 +167,9 @@ public:
             pull_appdata();
         }
 
-        pump_out();
+        if (ssl_ != nullptr) {
+            pump_out();
+        }
         rearm_timer();
     }
 
@@ -238,7 +254,7 @@ private:
     void pull_appdata()
     {
         uint8_t buf[2048];
-        while (true) {
+        while (running_) {
             int n = SSL_read(ssl_, buf, sizeof(buf));
             if (n <= 0) {
                 int err = SSL_get_error(ssl_, n);
@@ -264,7 +280,7 @@ private:
     void pump_out()
     {
         uint8_t buf[2048];
-        while (true) {
+        while (running_) {
             std::lock_guard<std::mutex> lock(io_mu_);
             int n = BIO_read(out_bio_, buf, sizeof(buf));
             if (n <= 0) {
@@ -299,7 +315,7 @@ private:
         }
 
         auto ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(next).time_since_epoch();
-        if (ns.count() < 0) {
+        if ((ns.count() < 0) || !(running_)) {
             ns = std::chrono::nanoseconds(0);
         }
 

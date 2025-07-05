@@ -8,9 +8,14 @@
 #include <iostream>
 #include <memory>
 #include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <csignal>
 
 #include <sys/stat.h>
 
+static std::mutex mu_;
+static std::condition_variable running_;
 
 void print_hex(const uint8_t *buf, int sz)
 {
@@ -147,9 +152,19 @@ static void cli_app_cb(const io_t::endpoint_t &, const uint8_t *p, size_t n, io_
     }
 }
 
+static void kill_app(int sig)
+{
+    running_.notify_all();
+}
+
 int main(int argc, char **argv)
 {
+
     arg_opts_t cfg = parse_args(argc, argv);
+
+    signal(SIGINT, kill_app);
+    signal(SIGQUIT, kill_app);
+    signal(SIGTERM, kill_app);
 
     if (cfg.daemon) {
         daemonize();
@@ -170,7 +185,9 @@ int main(int argc, char **argv)
         srv = std::make_shared<dtls_server_t>(
             [&udp](const io_t::endpoint_t &to,
                    const uint8_t *d, size_t n) {
-                udp->write(to, d, n);
+                if (udp.get()) {
+                    udp->write(to, d, n);
+                }
             },
             cfg.ca_file, cfg.cert_file, cfg.key_file,
             srv_app_cb,
@@ -186,7 +203,9 @@ int main(int argc, char **argv)
         cli = std::make_shared<dtls_client_t>(
             [&udp](const io_t::endpoint_t &to,
                    const uint8_t *d, size_t n) {
-                udp->write(to, d, n);
+                if (udp.get()) {
+                    udp->write(to, d, n);
+                }
             },
             remote,
             cfg.ca_file, cfg.cert_file, cfg.key_file,
@@ -206,6 +225,19 @@ int main(int argc, char **argv)
                                                                                                              : "bridge")
               << " mode\n";
 
-    std::this_thread::sleep_for(std::chrono::hours(24));
+    std::unique_lock<std::mutex> lk{mu_};
+    running_.wait(lk);
+    std::cerr << "Catch SIGKILL/SIGINT signal. Exiting..\n";
+    tun.reset();
+
+    if (cli) {
+        cli.reset();
+    }
+
+    if (srv) {
+        srv.reset();
+    }
+
+    udp.reset();
     return 0;
 }
