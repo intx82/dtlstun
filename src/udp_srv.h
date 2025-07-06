@@ -75,7 +75,7 @@ public:
 
     void stop(void)
     {
-        std::cerr << "UDP layer exiting..\n";
+        spdlog::warn("UDP: exiting..");
         if (!running_.exchange(false)) {
             return;
         }
@@ -116,8 +116,11 @@ public:
         sa.sin_family = AF_INET;
         sa.sin_port = htons(to.port);
 
-        if (inet_pton(AF_INET, to.host.c_str(), &sa.sin_addr) != 1)
+        spdlog::debug("UDP: send {}:{} {} bytes", to.host, to.port, len);
+
+        if (inet_pton(AF_INET, to.host.c_str(), &sa.sin_addr) != 1) {
             throw std::invalid_argument("udp_server_t: bad address");
+        }
 
         int retries = 20;
         for (;;) {
@@ -187,9 +190,10 @@ private:
                     from.host = ip;
                     from.port = ntohs(peer.sin_port);
 
-                    if (cb_)
-                        cb_(from, buf.data(),
-                            (size_t)n, *this);
+                    if (cb_) {
+                        spdlog::debug("UDP: Receive {}:{} size: {}", ip, from.port, n);
+                        cb_(from, buf.data(), (size_t)n, *this);
+                    }
                 }
             }
         }

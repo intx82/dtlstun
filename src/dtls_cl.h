@@ -1,10 +1,12 @@
 #ifndef __DTLS_CLIENT_H__
 #define __DTLS_CLIENT_H__
 
-#include "io.h"
-
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <spdlog/spdlog.h>
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -18,13 +20,11 @@
 #include <thread>
 #include <vector>
 
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
-#include <unistd.h>
+#include "io.h"
 
 class dtls_client_t : public io_t
 {
-public:
+   public:
     using send_callback =
         std::function<void(const io_t::endpoint_t &, const uint8_t *, size_t)>;
 
@@ -69,6 +69,28 @@ public:
         do_handshake();
     }
 
+    void set_verify_peer(bool state)
+    {
+        if (state) {
+            SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+            SSL_CTX_set_verify_depth(ctx_, 4);
+        } else {
+            SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, NULL);
+        }
+    }
+
+
+
+    static int verify_cb(int ok, X509_STORE_CTX *ctx)
+    {
+        if (!ok) {
+            spdlog::warn("dtls_client: client cert verify failed: {}", X509_verify_cert_error_string(X509_STORE_CTX_get_error(ctx)));
+        } else {
+            spdlog::info("dtls_client: Certificate verify OK");
+        }
+        return ok;
+    }
+
     ~dtls_client_t() override
     {
         stop();
@@ -76,12 +98,12 @@ public:
 
     void stop()
     {
-        std::cerr << "DTLS-Client exiting.. Sending Encrypted-Alert to the server\n";
+        spdlog::info("DTLS-Client exiting.. Sending Encrypted-Alert to the server");
         SSL_shutdown(ssl_);
         pump_out();
 
         running_.exchange(false);
-        usleep(250000); // just to receive server-side encrypted alert
+        usleep(250000);  // just to receive server-side encrypted alert
 
         itimerspec dis{};
         dis.it_value.tv_sec = 0;
@@ -106,9 +128,11 @@ public:
 
     void write(const endpoint_t &, const uint8_t *p, size_t n) override
     {
+        spdlog::debug("dtls_client: Send DGRAM: {}:{} sz: {}", server_ep_.host, server_ep_.port, n);
+
         if (!handshake_done_) {
-            std::cerr << "dtls_client: Session closed. Reestablishing connection " << server_ep_.host << ":" << server_ep_.port << "\n";
-            do_handshake();
+            ssl_deadline_ = now() + std::chrono::seconds(1);
+            rearm_timer();
             return;
         }
 
@@ -136,7 +160,7 @@ public:
             return;
         }
 
-        last_tx_ = now();
+        last_io_ = now();
         pump_out();
         rearm_timer();
     }
@@ -147,12 +171,13 @@ public:
             return;
         }
 
-        last_rx_ = now();
-
+        spdlog::debug("dtls_client: Receive DGRAM: {}:{} sz: {}", from.host, from.port, len);
         if (ssl_ == nullptr) {
+            rearm_timer();
             return;
         }
 
+        last_io_ = now();
         {
             std::lock_guard<std::mutex> lock(io_mu_);
             if (BIO_write(in_bio_, d, (int)len) != (int)len) {
@@ -161,9 +186,7 @@ public:
             }
         }
 
-        if (!handshake_done_) {
-            do_handshake();
-        } else {
+        if (handshake_done_) {
             pull_appdata();
         }
 
@@ -175,7 +198,7 @@ public:
 
     bool connected() const { return handshake_done_; }
 
-private:
+   private:
     void init_openssl()
     {
         SSL_library_init();
@@ -238,7 +261,7 @@ private:
         int ret = SSL_do_handshake(ssl_);
         if (ret == 1) {
             handshake_done_ = true;
-            std::cerr << "dtls_client: Handshake done  " << server_ep_.host << ":" << server_ep_.port << "\n";
+            spdlog::info("dtls_client: Handshake done {}:{} ", server_ep_.host, server_ep_.port);
         } else {
             int err = SSL_get_error(ssl_, ret);
             if (err != SSL_ERROR_WANT_READ &&
@@ -297,8 +320,7 @@ private:
     {
         struct timeval tv;
         if (DTLSv1_get_timeout(ssl_, &tv) != 0) {
-            auto us = std::chrono::microseconds(tv.tv_sec * 1'000'000LL + tv.tv_usec);
-            ssl_deadline_ = now() + us;
+            ssl_deadline_ = now() + std::chrono::microseconds(tv.tv_sec * 1'000'000LL + tv.tv_usec);
         } else {
             ssl_deadline_ = clk::time_point::max();
         }
@@ -306,7 +328,7 @@ private:
 
     void rearm_timer()
     {
-        clk::time_point next = std::min(ssl_deadline_, last_rx_ + idle_to_);
+        clk::time_point next = std::min(ssl_deadline_, last_io_ + idle_to_);
 
         if (next == clk::time_point::max()) {
             itimerspec dis{};
@@ -314,14 +336,28 @@ private:
             return;
         }
 
-        auto ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(next).time_since_epoch();
-        if ((ns.count() < 0) || !(running_)) {
-            ns = std::chrono::nanoseconds(0);
+        if (next < clk::now()) {
+            next = clk::now() + idle_to_;
+        }
+
+        std::chrono::nanoseconds ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(next).time_since_epoch();
+        if (!running_) {
+            ns = clk::now().time_since_epoch();
         }
 
         itimerspec its{};
         its.it_value.tv_sec = ns.count() / 1'000'000'000LL;
         its.it_value.tv_nsec = ns.count() % 1'000'000'000LL;
+
+        if (its.it_value.tv_nsec >= 1'000'000'000) {
+            its.it_value.tv_nsec -= 1'000'000'000;
+            its.it_value.tv_sec++;
+        }
+
+        spdlog::debug("dtls_client: Timer fire in {} ms; Now {} ms",
+                      std::chrono::duration_cast<std::chrono::milliseconds>(next - clk::now()).count(),
+                      std::chrono::duration_cast<std::chrono::milliseconds>(clk::now().time_since_epoch()).count());
+
         timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &its, nullptr);
     }
 
@@ -330,7 +366,6 @@ private:
         epoll_event ev;
         while (running_) {
             int n = epoll_wait(efd_, &ev, 1, -1);
-
             if (n < 0 && errno == EINTR) {
                 continue;
             }
@@ -347,27 +382,36 @@ private:
     {
         auto now_tp = now();
 
-        if (now_tp >= ssl_deadline_) {
-
-            if (DTLSv1_handle_timeout(ssl_) <= 0) {
-                print_ssl_err("handle_timeout");
-                close_session();
-                return;
-            }
-
-            update_ssl_deadline();
-            pump_out();
+        if (!handshake_done_ || ssl_ == nullptr) {
+            spdlog::info("dtls_client: Session closed. Reestablishing connection {}:{}", server_ep_.host, server_ep_.port);
+            do_handshake();
+            rearm_timer();
+            return;
         }
 
-        if (now_tp - last_rx_ > idle_to_) {
+        if (now_tp >= ssl_deadline_) {
+            if (ssl_ != nullptr) {
+                if (DTLSv1_handle_timeout(ssl_) <= 0) {
+                    print_ssl_err("handle_timeout");
+                    close_session();
+                    return;
+                }
+
+                update_ssl_deadline();
+                pump_out();
+            }
+        }
+
+        if (now_tp - last_io_ > idle_to_) {
             close_session();
         }
+
         rearm_timer();
     }
 
     void close_session()
     {
-        std::cerr << "dtls_client: Session close " << server_ep_.host << ":" << server_ep_.port << "\n";
+        spdlog::warn("dtls_client: Session close {}:{}", server_ep_.host, server_ep_.port);
         handshake_done_ = false;
         if (!ssl_) {
             return;
@@ -398,7 +442,7 @@ private:
         int err = ERR_get_error();
         if (err != 0) {
             ERR_error_string_n(err, buf, sizeof(buf));
-            std::cerr << "dtls_client: " << where << ": " << buf << '\n';
+            spdlog::error("dtls_client: {}: {}", where, buf);
         }
         ERR_clear_error();
     }
@@ -414,8 +458,7 @@ private:
 
     bool handshake_done_{false};
     clk::time_point ssl_deadline_{clk::time_point::max()};
-    clk::time_point last_rx_{now()};
-    clk::time_point last_tx_{now()};
+    clk::time_point last_io_{now()};
     std::chrono::seconds idle_to_;
     std::mutex io_mu_;
 
@@ -428,6 +471,67 @@ private:
     int timer_fd_{-1};
     std::thread thr_;
     std::atomic<bool> running_;
+
+   public:
+
+    void enable_debug()
+    {
+        SSL_CTX_set_info_callback(ctx_, info_cb);
+        SSL_CTX_set_msg_callback(ctx_, msg_cb);
+        SSL_CTX_set_msg_callback_arg(ctx_, this);
+    }
+
+   private:
+    static void info_cb(const SSL *ssl, int where, int ret)
+    {
+        const char *str;
+        int w = where & ~SSL_ST_MASK;
+
+        if (w & SSL_ST_CONNECT) {
+            str = "SSL_connect";
+        } else if (w & SSL_ST_ACCEPT) {
+            str = "SSL_accept";
+        } else {
+            str = "undefined";
+        }
+
+        if (where & SSL_CB_LOOP) {
+            spdlog::debug("dtls_client: {}: {}", str, SSL_state_string_long(ssl));
+        } else if (where & SSL_CB_EXIT) {
+            if (ret == 0) {
+                spdlog::debug("dtls_client: {}: failed in {}", str, SSL_state_string_long(ssl));
+            }
+        }
+    }
+
+    static const char *rt_name(int ct)
+    {
+        switch ((uint8_t)ct) {
+            case SSL3_RT_HANDSHAKE:
+                return "HS";
+            case SSL3_RT_ALERT:
+                return "AL";
+            case SSL3_RT_CHANGE_CIPHER_SPEC:
+                return "CC";
+            case SSL3_RT_APPLICATION_DATA:
+                return "AP";
+#ifdef DTLS1_RT_HEARTBEAT
+            case DTLS1_RT_HEARTBEAT:
+                return "HB";
+#endif
+            default:
+                return "??";
+        }
+    }
+
+    static void msg_cb(int write_p, int ver, int content_type,
+                       const void *buf, size_t len, SSL *ssl, void *arg)
+    {
+        const char *dir = write_p ? "→" : "←";
+        const char *ct = rt_name(content_type);
+
+        spdlog::debug("dtls_server: {} {} - len: {} bytes", dir, ct, len);
+    }
 };
 
 #endif

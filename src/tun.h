@@ -9,6 +9,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <spdlog/spdlog.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -115,11 +116,12 @@ class tun_if_t : public io_t
             ::close(fd);
         }
         fds_.clear();
-        std::cerr << "TUN layer exiting..\n";
+        spdlog::warn("TUN: exiting..");
     }
 
     void write(const endpoint_t &, const uint8_t *data, size_t len) override
     {
+        spdlog::debug("TUN: write {} bytes", len);
         int fd = fds_[tx_seq_.fetch_add(1) % fds_.size()];
         ssize_t n = ::write(fd, data, len);
         if (n < 0) {
@@ -129,6 +131,7 @@ class tun_if_t : public io_t
 
     static void bring_up(const std::string &dev)
     {
+        spdlog::info("TUN: set-up {} interface", dev);
         int s = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         if (s < 0) {
             throw std::runtime_error("socket()");
@@ -150,6 +153,7 @@ class tun_if_t : public io_t
 
     static void configure_ipv4(const std::string &dev, const std::string &ip, uint8_t cidr)
     {
+        spdlog::info("TUN: {} IP: {}/{} ", dev, ip, cidr);
         int s = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         if (s < 0) {
             throw std::runtime_error("socket()");
@@ -246,6 +250,7 @@ class tun_if_t : public io_t
 
             static endpoint_t null_ep{};
             if (rx_cb_) {
+                spdlog::debug("TUN: Receive {} bytes", n);
                 rx_cb_(null_ep, buf.data(), static_cast<size_t>(n), *this);
             }
         }

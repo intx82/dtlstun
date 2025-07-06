@@ -1,3 +1,4 @@
 **/certs/**
 **/.vscode/**
 **/build/**
+out.log

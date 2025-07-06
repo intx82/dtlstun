@@ -3,6 +3,11 @@
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <spdlog/spdlog.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -18,14 +23,10 @@
 #include <vector>
 
 #include "io.h"
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <sys/timerfd.h>
-#include <unistd.h>
 
 class dtls_server_t : public io_t
 {
-public:
+   public:
     using send_callback =
         std::function<void(const io_t::endpoint_t &, const uint8_t *, size_t)>;
 
@@ -47,9 +48,31 @@ public:
         setup_timer_thread();
     }
 
+    void set_verify_peer(bool state)
+    {
+        if (state) {
+            SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, verify_cb);
+            SSL_CTX_set_verify_depth(ctx_, 4);
+        } else {
+            SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, NULL);
+        }
+    }
+
+
+    static int verify_cb(int ok, X509_STORE_CTX *ctx)
+    {
+        if (!ok) {
+            spdlog::warn("dtls_server: client cert verify failed: {}", X509_verify_cert_error_string(X509_STORE_CTX_get_error(ctx)));
+        } else {
+            spdlog::info("dtls_server: Certificate verify OK");
+        }
+        return ok;
+    }
+
+
     ~dtls_server_t() override
     {
-        std::cerr << "DTLS-Server exiting..\n";
+        spdlog::warn("dtls_server: exiting..\n");
 
         for (auto &kv : sessions_) {
             endpoint_t ep = parse_key(kv.first);
@@ -63,11 +86,11 @@ public:
             pump_out_bio(s, ep);
         }
 
-        usleep(250000); // to receive encrypted alert from clients
+        usleep(250000);  // to receive encrypted alert from clients
 
         running_ = false;
         uint64_t one = 1;
-        ::write(wakeup_fd_, &one, sizeof(one));
+        ::write(exit_fd_, &one, sizeof(one));
 
         if (thr_.joinable()) {
             thr_.join();
@@ -80,7 +103,7 @@ public:
         SSL_CTX_free(ctx_);
         close(timer_fd_);
         close(efd_);
-        close(wakeup_fd_);
+        close(exit_fd_);
     }
 
     void handle_datagram(const io_t::endpoint_t &from,
@@ -156,8 +179,7 @@ public:
         std::lock_guard<std::mutex> lg(mu_);
         auto it = sessions_.find(key(to));
         if (it == sessions_.end()) {
-            std::cerr << "dtls_server_t: no session for "
-                      << to.host << ':' << to.port << '\n';
+            spdlog::warn("dtls_server: no session for {}:{}", to.host, to.port);
             return;
         }
         session &s = *it->second;
@@ -214,12 +236,11 @@ public:
         arm_timerfd();
     }
 
-private:
+   private:
     using clk = std::chrono::steady_clock;
     static clk::time_point now() { return clk::now(); }
 
-    struct session
-    {
+    struct session {
         SSL *ssl = nullptr;
         BIO *in = nullptr;
         BIO *out = nullptr;
@@ -259,10 +280,6 @@ private:
             SSL_CTX_load_verify_locations(ctx_, ca.c_str(), nullptr) != 1) {
             throw_ssl("load_verify_locations");
         }
-
-        SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, NULL);
-        SSL_CTX_set_verify_depth(ctx_, 4);
-        // SSL_CTX_set_options(ctx_, SSL_OP_COOKIE_EXCHANGE);
     }
 
     session *get_or_create_session(const io_t::endpoint_t &peer)
@@ -273,7 +290,7 @@ private:
             return it->second.get();
         }
 
-        std::cerr << "dtls_server_t: Create new session for: " << peer.host << ":" << peer.port << "\n";
+        spdlog::info("dtls_server: Create new session for: {}:{}", peer.host, peer.port);
         auto up = std::make_unique<session>();
         session &s = *up;
 
@@ -299,7 +316,6 @@ private:
 
     void pump_out_bio(session &s, const io_t::endpoint_t &to)
     {
-
         while (BIO_ctrl_pending(s.out) > 0) {
             unsigned char hdr[13];
             {
@@ -348,15 +364,15 @@ private:
         efd_ = epoll_create1(EPOLL_CLOEXEC);
         timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
 
-        wakeup_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        exit_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         epoll_event _evt = {
             .events = EPOLLIN,
             .data = {.fd = timer_fd_},
         };
 
         epoll_ctl(efd_, EPOLL_CTL_ADD, timer_fd_, &_evt);
-        _evt.data.fd = wakeup_fd_;
-        epoll_ctl(efd_, EPOLL_CTL_ADD, wakeup_fd_, &_evt);
+        _evt.data.fd = exit_fd_;
+        epoll_ctl(efd_, EPOLL_CTL_ADD, exit_fd_, &_evt);
 
         thr_ = std::thread([this] {
             set_thread_name("dtls-srv-rx");
@@ -390,6 +406,7 @@ private:
         timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &its, nullptr);
     }
 
+
     void timer_loop()
     {
         constexpr int MAXEV = 4;
@@ -406,9 +423,11 @@ private:
                     uint64_t junk;
                     ::read(timer_fd_, &junk, sizeof(junk));
                     on_tick();
-                } else if (fd == wakeup_fd_) {
+                } else if (fd == exit_fd_) {
                     uint64_t junk;
-                    ::read(wakeup_fd_, &junk, sizeof(junk));
+                    ::read(exit_fd_, &junk, sizeof(junk));
+                    running_ = false;
+                    break;
                 }
             }
         }
@@ -475,7 +494,7 @@ private:
         int err = ERR_get_error();
         if (err != 0) {
             ERR_error_string_n(err, buf, sizeof(buf));
-            std::cerr << "dtls_server_t: " << where << ": " << buf << '\n';
+            spdlog::error("dtls_server: {}: {}", where, buf);
         }
         ERR_clear_error();
     }
@@ -483,7 +502,7 @@ private:
     void close_and_erase(const io_t::endpoint_t &ep,
                          std::unique_ptr<session> &up)
     {
-        std::cerr << "dtls_server_t: Closing session for: " << ep.host << ":" << ep.port << "\n";
+        spdlog::warn("dtls_server: Closing session for: {}:{}", ep.host, ep.port);
         session &s = *up;
         if (!(SSL_get_shutdown(s.ssl) & SSL_SENT_SHUTDOWN)) {
             SSL_shutdown(s.ssl);
@@ -503,20 +522,19 @@ private:
     std::mutex mu_;
     std::mutex io_mu_;
 
-    int efd_{-1}, timer_fd_{-1}, wakeup_fd_{-1};
+    int efd_{-1}, timer_fd_{-1}, exit_fd_{-1};
     std::thread thr_;
     std::atomic<bool> running_{true};
 
-public:
-    void enable_debug(std::ostream &out = std::cerr)
+   public:
+    void enable_debug()
     {
-        debug_stream_ = &out;
         SSL_CTX_set_info_callback(ctx_, info_cb);
         SSL_CTX_set_msg_callback(ctx_, msg_cb);
         SSL_CTX_set_msg_callback_arg(ctx_, this);
     }
 
-private:
+   private:
     static void info_cb(const SSL *ssl, int where, int ret)
     {
         const char *str;
@@ -531,10 +549,10 @@ private:
         }
 
         if (where & SSL_CB_LOOP) {
-            log(ssl, "%s: %s\n", str, SSL_state_string_long(ssl));
+            spdlog::debug("dtls_server: {}: {}", str, SSL_state_string_long(ssl));
         } else if (where & SSL_CB_EXIT) {
             if (ret == 0) {
-                log(ssl, "%s: failed in %s\n", str, SSL_state_string_long(ssl));
+                spdlog::debug("dtls_server: {}: failed in {}", str, SSL_state_string_long(ssl));
             }
         }
     }
@@ -542,54 +560,31 @@ private:
     static const char *rt_name(int ct)
     {
         switch ((uint8_t)ct) {
-        case SSL3_RT_HANDSHAKE:
-            return "HS";
-        case SSL3_RT_ALERT:
-            return "AL";
-        case SSL3_RT_CHANGE_CIPHER_SPEC:
-            return "CC";
-        case SSL3_RT_APPLICATION_DATA:
-            return "AP";
+            case SSL3_RT_HANDSHAKE:
+                return "HS";
+            case SSL3_RT_ALERT:
+                return "AL";
+            case SSL3_RT_CHANGE_CIPHER_SPEC:
+                return "CC";
+            case SSL3_RT_APPLICATION_DATA:
+                return "AP";
 #ifdef DTLS1_RT_HEARTBEAT
-        case DTLS1_RT_HEARTBEAT:
-            return "HB";
+            case DTLS1_RT_HEARTBEAT:
+                return "HB";
 #endif
-        default:
-            return "??";
+            default:
+                return "??";
         }
     }
 
     static void msg_cb(int write_p, int ver, int content_type,
                        const void *buf, size_t len, SSL *ssl, void *arg)
     {
-        auto *self = static_cast<dtls_server_t *>(arg);
-        if (!self->debug_stream_) {
-            return;
-        }
-
         const char *dir = write_p ? "→" : "←";
         const char *ct = rt_name(content_type);
 
-        *self->debug_stream_ << "[DTLS " << dir << ' ' << ct
-                             << "] " << len << " bytes\n";
+        spdlog::debug("dtls_server: {} {} - len: {} bytes", dir, ct, len);
     }
-
-    template <typename... Args>
-    static void log(const SSL *ssl, const char *fmt, Args... args)
-    {
-        auto *ctx = SSL_get_SSL_CTX(ssl);
-        auto *self = static_cast<dtls_server_t *>(SSL_CTX_get_app_data(ctx));
-
-        if (!self || !self->debug_stream_) {
-            return;
-        }
-
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), fmt, args...);
-        *self->debug_stream_ << buf;
-    }
-
-    std::ostream *debug_stream_{nullptr};
 };
 
 #endif

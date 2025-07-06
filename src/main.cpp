@@ -1,18 +1,19 @@
+#include <spdlog/spdlog.h>
+#include <sys/stat.h>
+
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <thread>
+
 #include "arg_parse.h"
 #include "dtls_cl.h"
 #include "dtls_srv.h"
 #include "tun.h"
 #include "udp_srv.h"
-
-#include <chrono>
-#include <iostream>
-#include <memory>
-#include <thread>
-#include <condition_variable>
-#include <mutex>
-#include <csignal>
-
-#include <sys/stat.h>
 
 static std::mutex mu_;
 static std::condition_variable running_;
@@ -67,7 +68,7 @@ static void daemonize()
     }
 
     ::umask(0);
-//    ::chdir("/");
+    //    ::chdir("/");
 
     int fd = ::open("/dev/null", O_RDWR);
     if (fd >= 0) {
@@ -80,8 +81,7 @@ static void daemonize()
     }
 }
 
-struct bridge_ctx_t
-{
+struct bridge_ctx_t {
     dtls_server_t *srv{nullptr};
     dtls_client_t *cli{nullptr};
     udp_server_t *udp{nullptr};
@@ -159,8 +159,15 @@ static void kill_app(int sig)
 
 int main(int argc, char **argv)
 {
-
     arg_opts_t cfg = parse_args(argc, argv);
+
+    if (cfg.verbose) {
+        spdlog::set_level(spdlog::level::debug);
+    } else {
+        spdlog::set_level(spdlog::level::info);
+    }
+
+    spdlog::set_pattern("[%H:%M:%S:%f] [%^%l%$] [tid:%t] %v");
 
     signal(SIGINT, kill_app);
     signal(SIGQUIT, kill_app);
@@ -189,13 +196,15 @@ int main(int argc, char **argv)
                     udp->write(to, d, n);
                 }
             },
-            cfg.ca_file, cfg.cert_file, cfg.key_file,
+            cfg.server_ca_file, cfg.server_cert_file, cfg.server_key_file,
             srv_app_cb,
             cfg.mtu,
             std::chrono::seconds(cfg.idle_sec));
 
         ctx.srv = srv.get();
         srv->set_user_data(&ctx);
+        srv->set_verify_peer(cfg.server_verify_peer);
+        srv->enable_debug();
     }
 
     if (cfg.mode != arg_opts_t::mode_t::SERVER) {
@@ -208,26 +217,25 @@ int main(int argc, char **argv)
                 }
             },
             remote,
-            cfg.ca_file, cfg.cert_file, cfg.key_file,
+            cfg.client_ca_file, cfg.client_cert_file, cfg.client_key_file,
             cli_app_cb,
             cfg.mtu,
             std::chrono::seconds(cfg.idle_sec));
 
         ctx.cli = cli.get();
         cli->set_user_data(&ctx);
+        cli->set_verify_peer(cfg.client_verify_peer);
+        cli->enable_debug();
     }
 
     tun->set_user_data(&ctx);
     udp->set_user_data(&ctx);
 
-    std::cerr << "Running in "
-              << (cfg.mode == arg_opts_t::mode_t::SERVER ? "server" : cfg.mode == arg_opts_t::mode_t::CLIENT ? "client"
-                                                                                                             : "bridge")
-              << " mode\n";
+    spdlog::info("Running in {} mode", (cfg.mode == arg_opts_t::mode_t::SERVER ? "server" : cfg.mode == arg_opts_t::mode_t::CLIENT ? "client" : "bridge"));
 
     std::unique_lock<std::mutex> lk{mu_};
     running_.wait(lk);
-    std::cerr << "Catch SIGKILL/SIGINT signal. Exiting..\n";
+    spdlog::warn("Catch SIGKILL/SIGINT signal. Exiting..");
     tun.reset();
 
     if (cli) {

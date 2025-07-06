@@ -18,9 +18,13 @@ struct arg_opts_t
     std::string remote_ip = "";
     uint16_t remote_port = 0;
 
-    std::string ca_file = "";
-    std::string cert_file = "";
-    std::string key_file = "";
+    std::string server_ca_file = "";
+    std::string server_cert_file = "";
+    std::string server_key_file = "";
+
+    std::string client_ca_file = "";
+    std::string client_cert_file = "";
+    std::string client_key_file = "";
 
     std::string tun_name = "tun0";
     uint16_t mtu = 1420;
@@ -30,6 +34,8 @@ struct arg_opts_t
     uint32_t idle_sec = 120;
     bool verbose = false;
     bool daemon  = false;
+    bool server_verify_peer = true;
+    bool client_verify_peer = true;
 };
 
 arg_opts_t parse_args(int argc, char **argv);
