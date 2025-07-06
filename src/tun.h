@@ -233,7 +233,6 @@ class tun_if_t : public io_t
         while (running_) {
             ssize_t n = ::read(fd, buf.data(), buf.size());
             if (n < 0) {
-                std::cerr << __FILE__ << ":" << __LINE__ << "\n";
                 if (errno == EINTR) {
                     continue;
                 }

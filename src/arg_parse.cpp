@@ -54,7 +54,7 @@ arg_opts_t parse_args(int argc, char **argv)
         {"daemon", no_argument, 0, 'd'},
         {0, 0, 0, 0}};
     int c, idx;
-    while ((c = getopt_long(argc, argv, "m:p:r:q:t:vh", long_opts, &idx)) != -1) {
+    while ((c = getopt_long(argc, argv, "m:p:r:t:i:vhd", long_opts, &idx)) != -1) {
         switch (c) {
         case 'm':
             if (std::string{optarg} == "server") {
