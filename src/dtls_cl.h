@@ -22,6 +22,8 @@
 
 #include "io.h"
 
+using namespace std::chrono_literals;
+
 class dtls_client_t : public io_t
 {
    public:
@@ -35,7 +37,7 @@ class dtls_client_t : public io_t
                   const std::string &key_file,
                   receive_callback rx_cb,
                   size_t mtu = 1440,
-                  std::chrono::seconds idle_to = std::chrono::minutes(2))
+                  std::chrono::seconds idle_to = 2min)
         : send_(std::move(send_cb)),
           server_ep_(std::move(server)),
           rx_cb_(std::move(rx_cb)),
@@ -79,8 +81,6 @@ class dtls_client_t : public io_t
         }
     }
 
-
-
     static int verify_cb(int ok, X509_STORE_CTX *ctx)
     {
         if (!ok) {
@@ -99,27 +99,18 @@ class dtls_client_t : public io_t
     void stop()
     {
         spdlog::info("DTLS-Client exiting.. Sending Encrypted-Alert to the server");
-        SSL_shutdown(ssl_);
-        pump_out();
-
+        close_session();
+        
         running_.exchange(false);
         usleep(250000);  // just to receive server-side encrypted alert
 
         itimerspec dis{};
         dis.it_value.tv_sec = 0;
-        dis.it_value.tv_nsec = 250'000'000LL;
+        dis.it_value.tv_nsec = 100'000'000LL;
         timerfd_settime(timer_fd_, 0, &dis, nullptr);
 
         if (thr_.joinable()) {
             thr_.join();
-        }
-
-        if (ssl_) {
-            SSL_free(ssl_);
-        }
-
-        if (ctx_) {
-            SSL_CTX_free(ctx_);
         }
 
         close(timer_fd_);
@@ -128,11 +119,12 @@ class dtls_client_t : public io_t
 
     void write(const endpoint_t &, const uint8_t *p, size_t n) override
     {
-        spdlog::debug("dtls_client: Send DGRAM: {}:{} sz: {}", server_ep_.host, server_ep_.port, n);
+        spdlog::debug("dtls_client: Send DGRAM: {}:{} sz: {} State: {}", server_ep_.host, server_ep_.port, n, hs_names_[hs_state_]);
 
-        if (!handshake_done_) {
-            ssl_deadline_ = now() + std::chrono::seconds(1);
-            rearm_timer();
+        if (hs_state_ != HANDSHAKE_DONE) {
+            spdlog::debug("dtls_client: Timer: Re-arm handshake {}", hs_state_);
+            hs_state_ = HANDSHAKE_IN_PROGRESS;
+            rearm_timer(100ms);
             return;
         }
 
@@ -162,7 +154,8 @@ class dtls_client_t : public io_t
 
         last_io_ = now();
         pump_out();
-        rearm_timer();
+        spdlog::debug("dtls_client: Timer Re-arm write");
+        rearm_timer(idle_to_);
     }
 
     void handle_datagram(const endpoint_t &from, const uint8_t *d, size_t len)
@@ -171,32 +164,26 @@ class dtls_client_t : public io_t
             return;
         }
 
-        spdlog::debug("dtls_client: Receive DGRAM: {}:{} sz: {}", from.host, from.port, len);
-        if (ssl_ == nullptr) {
-            rearm_timer();
-            return;
-        }
+        spdlog::debug("dtls_client: Receive DGRAM: {}:{} sz: {} State: {}", from.host, from.port, len, hs_names_[hs_state_]);
+        if ((ssl_ != nullptr ) && (hs_state_ != handshake_state_t::HANDSHAKE_NOT_STARTED)) {
 
-        last_io_ = now();
-        {
             std::lock_guard<std::mutex> lock(io_mu_);
             if (BIO_write(in_bio_, d, (int)len) != (int)len) {
                 print_ssl_err("BIO_write");
                 return;
             }
+
+            if (connected()) {
+                pull_appdata();
+            }
+
+            last_io_ = now();
         }
 
-        if (handshake_done_) {
-            pull_appdata();
-        }
-
-        if (ssl_ != nullptr) {
-            pump_out();
-        }
-        rearm_timer();
+        rearm_timer( hs_state_ != handshake_state_t::HANDSHAKE_DONE ? 100ms : idle_to_);
     }
 
-    bool connected() const { return handshake_done_; }
+    bool connected() const { return hs_state_ == handshake_state_t::HANDSHAKE_DONE; }
 
    private:
     void init_openssl()
@@ -231,6 +218,7 @@ class dtls_client_t : public io_t
     void create_ssl()
     {
         if (ssl_) {
+            spdlog::debug("dtls_client: Create_ssl: Free old ssl context");
             SSL_free(ssl_);
             ssl_ = nullptr;
         }
@@ -250,6 +238,7 @@ class dtls_client_t : public io_t
 
         SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
         SSL_set_connect_state(ssl_);
+        hs_state_ = handshake_state_t::HANDSHAKE_IN_PROGRESS;
     }
 
     void do_handshake()
@@ -260,7 +249,7 @@ class dtls_client_t : public io_t
 
         int ret = SSL_do_handshake(ssl_);
         if (ret == 1) {
-            handshake_done_ = true;
+            hs_state_ = handshake_state_t::HANDSHAKE_DONE;
             spdlog::info("dtls_client: Handshake done {}:{} ", server_ep_.host, server_ep_.port);
         } else {
             int err = SSL_get_error(ssl_, ret);
@@ -270,7 +259,6 @@ class dtls_client_t : public io_t
                 close_session();
             }
         }
-        update_ssl_deadline();
         pump_out();
     }
 
@@ -316,34 +304,33 @@ class dtls_client_t : public io_t
     using clk = std::chrono::steady_clock;
     static clk::time_point now() { return clk::now(); }
 
-    void update_ssl_deadline()
+    std::chrono::microseconds update_ssl_deadline()
     {
+        if (ssl_ == nullptr) {
+            return 1s;
+        }
+
         struct timeval tv;
         if (DTLSv1_get_timeout(ssl_, &tv) != 0) {
-            ssl_deadline_ = now() + std::chrono::microseconds(tv.tv_sec * 1'000'000LL + tv.tv_usec);
+            return std::chrono::microseconds(tv.tv_sec * 1'000'000LL + tv.tv_usec);
         } else {
-            ssl_deadline_ = clk::time_point::max();
+            return idle_to_;
         }
     }
 
-    void rearm_timer()
+    void rearm_timer(std::chrono::milliseconds fire_in)
     {
-        clk::time_point next = std::min(ssl_deadline_, last_io_ + idle_to_);
+        clk::time_point next = clk::now() + fire_in;
 
-        if (next == clk::time_point::max()) {
+        if (fire_in <= 0s) {
+            spdlog::debug("dtls_client: Timer disable");
             itimerspec dis{};
             timerfd_settime(timer_fd_, 0, &dis, nullptr);
             return;
         }
 
-        if (next < clk::now()) {
-            next = clk::now() + idle_to_;
-        }
-
+        spdlog::debug("dtls_client: Timer fire in {} ms", fire_in.count());
         std::chrono::nanoseconds ns = std::chrono::time_point_cast<std::chrono::nanoseconds>(next).time_since_epoch();
-        if (!running_) {
-            ns = clk::now().time_since_epoch();
-        }
 
         itimerspec its{};
         its.it_value.tv_sec = ns.count() / 1'000'000'000LL;
@@ -353,10 +340,6 @@ class dtls_client_t : public io_t
             its.it_value.tv_nsec -= 1'000'000'000;
             its.it_value.tv_sec++;
         }
-
-        spdlog::debug("dtls_client: Timer fire in {} ms; Now {} ms",
-                      std::chrono::duration_cast<std::chrono::milliseconds>(next - clk::now()).count(),
-                      std::chrono::duration_cast<std::chrono::milliseconds>(clk::now().time_since_epoch()).count());
 
         timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &its, nullptr);
     }
@@ -380,53 +363,33 @@ class dtls_client_t : public io_t
 
     void on_tick()
     {
-        auto now_tp = now();
-
-        if (!handshake_done_ || ssl_ == nullptr) {
-            spdlog::info("dtls_client: Session closed. Reestablishing connection {}:{}", server_ep_.host, server_ep_.port);
+        spdlog::debug("dtls_client: Timer fired. State: {}", hs_names_[hs_state_]);
+        if (hs_state_ == handshake_state_t::HANDSHAKE_IN_PROGRESS) {
             do_handshake();
-            rearm_timer();
-            return;
-        }
+            rearm_timer(100ms);
+        } else if (hs_state_ == handshake_state_t::SESSION_CLOSING) {
 
-        if (now_tp >= ssl_deadline_) {
-            if (ssl_ != nullptr) {
-                if (DTLSv1_handle_timeout(ssl_) <= 0) {
-                    print_ssl_err("handle_timeout");
-                    close_session();
-                    return;
+            if (ssl_) {
+                if (!(SSL_get_shutdown(ssl_) & SSL_SENT_SHUTDOWN)) {
+                    SSL_shutdown(ssl_);
                 }
-
-                update_ssl_deadline();
                 pump_out();
+                SSL_free(ssl_);
+                ssl_ = nullptr;
             }
-        }
 
-        if (now_tp - last_io_ > idle_to_) {
-            close_session();
+            hs_state_ = handshake_state_t::HANDSHAKE_NOT_STARTED;
+            rearm_timer(idle_to_);
+        } else if ((hs_state_ == handshake_state_t::HANDSHAKE_DONE) || (hs_state_ == HANDSHAKE_NOT_STARTED)) {
+            rearm_timer(idle_to_);
         }
-
-        rearm_timer();
     }
 
     void close_session()
     {
         spdlog::warn("dtls_client: Session close {}:{}", server_ep_.host, server_ep_.port);
-        handshake_done_ = false;
-        if (!ssl_) {
-            return;
-        }
-
-        if (!(SSL_get_shutdown(ssl_) & SSL_SENT_SHUTDOWN)) {
-            SSL_shutdown(ssl_);
-        }
-
-        pump_out();
-
-        if (ssl_) {
-            SSL_free(ssl_);
-            ssl_ = nullptr;
-        }
+        hs_state_ = SESSION_CLOSING;
+        rearm_timer(100ms);
     }
 
     [[noreturn]] static void throw_ssl(const char *where)
@@ -447,6 +410,21 @@ class dtls_client_t : public io_t
         ERR_clear_error();
     }
 
+    enum handshake_state_t {
+        HANDSHAKE_NOT_STARTED = 0,
+        HANDSHAKE_IN_PROGRESS,
+        HANDSHAKE_DONE,
+        SESSION_CLOSING,
+        HANDSHAKE_MAX
+    };
+
+    const std::string hs_names_[handshake_state_t::HANDSHAKE_MAX] = {
+        "Session closed",
+        "Handshake in progress, Session closed",
+        "Handshake done, Session established",
+        "Session closing",
+    };
+
     send_callback send_;
     endpoint_t server_ep_;
     receive_callback rx_cb_;
@@ -456,8 +434,7 @@ class dtls_client_t : public io_t
     BIO *in_bio_{nullptr};
     BIO *out_bio_{nullptr};
 
-    bool handshake_done_{false};
-    clk::time_point ssl_deadline_{clk::time_point::max()};
+    handshake_state_t hs_state_{handshake_state_t::HANDSHAKE_NOT_STARTED};
     clk::time_point last_io_{now()};
     std::chrono::seconds idle_to_;
     std::mutex io_mu_;
@@ -473,7 +450,6 @@ class dtls_client_t : public io_t
     std::atomic<bool> running_;
 
    public:
-
     void enable_debug()
     {
         SSL_CTX_set_info_callback(ctx_, info_cb);
@@ -495,13 +471,16 @@ class dtls_client_t : public io_t
             str = "undefined";
         }
 
-        if (where & SSL_CB_LOOP) {
-            spdlog::debug("dtls_client: {}: {}", str, SSL_state_string_long(ssl));
-        } else if (where & SSL_CB_EXIT) {
-            if (ret == 0) {
-                spdlog::debug("dtls_client: {}: failed in {}", str, SSL_state_string_long(ssl));
+        spdlog::debug("dtls_client: {}: {}", str, SSL_state_string_long(ssl));
+
+        /*
+        if (where & SSL_CB_ALERT && where & SSL_CB_READ) {
+            int al = ret & 0xff;
+            if (al == SSL_AD_CLOSE_NOTIFY) {
+                
             }
         }
+        */
     }
 
     static const char *rt_name(int ct)
@@ -530,7 +509,7 @@ class dtls_client_t : public io_t
         const char *dir = write_p ? "→" : "←";
         const char *ct = rt_name(content_type);
 
-        spdlog::debug("dtls_server: {} {} - len: {} bytes", dir, ct, len);
+        spdlog::debug("dtls_client: {} {} - len: {} bytes", dir, ct, len);
     }
 };
 

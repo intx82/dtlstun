@@ -82,8 +82,10 @@ class dtls_server_t : public io_t
                 continue;
             }
 
-            SSL_shutdown(s.ssl);
-            pump_out_bio(s, ep);
+            if (s.hs_done) {
+                SSL_shutdown(s.ssl);
+                pump_out_bio(s, ep);
+            }
         }
 
         usleep(250000);  // to receive encrypted alert from clients
@@ -268,10 +270,8 @@ class dtls_server_t : public io_t
                           const std::string &crt,
                           const std::string &keyf)
     {
-        if (SSL_CTX_use_certificate_file(ctx_, crt.c_str(),
-                                         SSL_FILETYPE_PEM) != 1 ||
-            SSL_CTX_use_PrivateKey_file(ctx_, keyf.c_str(),
-                                        SSL_FILETYPE_PEM) != 1 ||
+        if (SSL_CTX_use_certificate_file(ctx_, crt.c_str(), SSL_FILETYPE_PEM) != 1 ||
+            SSL_CTX_use_PrivateKey_file(ctx_, keyf.c_str(), SSL_FILETYPE_PEM) != 1 ||
             SSL_CTX_check_private_key(ctx_) != 1) {
             throw_ssl("loading cert/key");
         }
@@ -504,9 +504,11 @@ class dtls_server_t : public io_t
     {
         spdlog::warn("dtls_server: Closing session for: {}:{}", ep.host, ep.port);
         session &s = *up;
-        if (!(SSL_get_shutdown(s.ssl) & SSL_SENT_SHUTDOWN)) {
-            SSL_shutdown(s.ssl);
-            pump_out_bio(s, ep);
+        if (s.hs_done) {
+            if (!(SSL_get_shutdown(s.ssl) & SSL_SENT_SHUTDOWN)) {
+                SSL_shutdown(s.ssl);
+                pump_out_bio(s, ep);
+            }
         }
         free_session(up);
         sessions_.erase(key(ep));
