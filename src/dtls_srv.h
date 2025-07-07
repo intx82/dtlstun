@@ -151,7 +151,7 @@ class dtls_server_t : public io_t
         }
 
         while (true) { /* decrypt app data */
-            uint8_t buf[2048];
+            uint8_t buf[16384];
             int n = SSL_read(s->ssl, buf, sizeof(buf));
             if (n <= 0) {
                 int err = SSL_get_error(s->ssl, n);
@@ -546,17 +546,13 @@ class dtls_server_t : public io_t
             str = "SSL_connect";
         } else if (w & SSL_ST_ACCEPT) {
             str = "SSL_accept";
+        } else if (w & SSL_CB_ALERT) {
+            str = "SSL_alert";
         } else {
             str = "undefined";
         }
 
-        if (where & SSL_CB_LOOP) {
-            spdlog::debug("dtls_server: {}: {}", str, SSL_state_string_long(ssl));
-        } else if (where & SSL_CB_EXIT) {
-            if (ret == 0) {
-                spdlog::debug("dtls_server: {}: failed in {}", str, SSL_state_string_long(ssl));
-            }
-        }
+        spdlog::debug("dtls_client: {}: {}", str, SSL_state_string_long(ssl));
     }
 
     static const char *rt_name(int ct)
@@ -582,7 +578,7 @@ class dtls_server_t : public io_t
     static void msg_cb(int write_p, int ver, int content_type,
                        const void *buf, size_t len, SSL *ssl, void *arg)
     {
-        const char *dir = write_p ? "→" : "←";
+        const char *dir = write_p ? ">" : "<";
         const char *ct = rt_name(content_type);
 
         spdlog::debug("dtls_server: {} {} - len: {} bytes", dir, ct, len);

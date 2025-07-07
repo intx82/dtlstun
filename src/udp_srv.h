@@ -26,7 +26,7 @@ class udp_server_t : public io_t
 public:
     explicit udp_server_t(uint16_t listen_port,
                           receive_callback cb,
-                          size_t buf_size = 2048)
+                          size_t buf_size = 16384)
         : cb_(std::move(cb)),
           buf_size_(buf_size),
           running_(true)

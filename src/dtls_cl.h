@@ -264,7 +264,7 @@ class dtls_client_t : public io_t
 
     void pull_appdata()
     {
-        uint8_t buf[2048];
+        uint8_t buf[16384];
         while (running_) {
             int n = SSL_read(ssl_, buf, sizeof(buf));
             if (n <= 0) {
@@ -290,7 +290,7 @@ class dtls_client_t : public io_t
 
     void pump_out()
     {
-        uint8_t buf[2048];
+        uint8_t buf[16384];
         while (running_) {
             std::lock_guard<std::mutex> lock(io_mu_);
             int n = BIO_read(out_bio_, buf, sizeof(buf));
@@ -467,20 +467,13 @@ class dtls_client_t : public io_t
             str = "SSL_connect";
         } else if (w & SSL_ST_ACCEPT) {
             str = "SSL_accept";
+        } else if (w & SSL_CB_ALERT) {
+            str = "SSL_alert";
         } else {
             str = "undefined";
         }
 
         spdlog::debug("dtls_client: {}: {}", str, SSL_state_string_long(ssl));
-
-        /*
-        if (where & SSL_CB_ALERT && where & SSL_CB_READ) {
-            int al = ret & 0xff;
-            if (al == SSL_AD_CLOSE_NOTIFY) {
-                
-            }
-        }
-        */
     }
 
     static const char *rt_name(int ct)
@@ -506,7 +499,7 @@ class dtls_client_t : public io_t
     static void msg_cb(int write_p, int ver, int content_type,
                        const void *buf, size_t len, SSL *ssl, void *arg)
     {
-        const char *dir = write_p ? "→" : "←";
+        const char *dir = write_p ? ">" : "<";
         const char *ct = rt_name(content_type);
 
         spdlog::debug("dtls_client: {} {} - len: {} bytes", dir, ct, len);
