@@ -84,22 +84,10 @@ static void daemonize()
 struct bridge_ctx_t {
     dtls_server_t *srv{nullptr};
     dtls_client_t *cli{nullptr};
-    udp_server_t *udp{nullptr};
+    udp_server_t *udp_cli{nullptr};
+    udp_server_t *udp_srv{nullptr};
     tun_if_t *tun{nullptr};
 };
-
-static void udp_rx_cb(const udp_server_t::endpoint_t &from, const uint8_t *d, size_t n, io_t &self)
-{
-    if (auto ctx = self.get_user_data<bridge_ctx_t>(); ctx != nullptr) {
-        if (ctx->srv != nullptr) {
-            ctx->srv->handle_datagram(from, d, n);
-        }
-
-        if (ctx->cli != nullptr) {
-            ctx->cli->handle_datagram(from, d, n);
-        }
-    }
-}
 
 static void tun_rx_cb(const io_t::endpoint_t &, const uint8_t *d, size_t n, io_t &self)
 {
@@ -177,23 +165,30 @@ int main(int argc, char **argv)
         daemonize();
     }
 
-    uint16_t bind_port = (cfg.mode == arg_opts_t::mode_t::SERVER) ? cfg.listen_port : 0;
-    auto udp = std::make_shared<udp_server_t>(bind_port, udp_rx_cb);
     auto tun = std::make_shared<tun_if_t>(cfg.tun_name, tun_rx_cb, cfg.mtu, cfg.tun_ip, cfg.tun_cidr);
 
     std::shared_ptr<dtls_server_t> srv;
+    std::shared_ptr<udp_server_t> udp_srv;
     std::shared_ptr<dtls_client_t> cli;
+    std::shared_ptr<udp_server_t> udp_cl;
+
     bridge_ctx_t ctx = {
-        .udp = udp.get(),
         .tun = tun.get(),
     };
 
     if (cfg.mode != arg_opts_t::mode_t::CLIENT) {
+        udp_srv = std::make_shared<udp_server_t>(cfg.listen_port, [](const io_t::endpoint_t &from, const uint8_t *d, size_t n, io_t &self) {
+            dtls_server_t *srv = self.get_user_data<dtls_server_t>();
+            if (srv != nullptr) {
+                srv->handle_datagram(from, d, n);
+            }
+        });
+
         srv = std::make_shared<dtls_server_t>(
-            [&udp](const io_t::endpoint_t &to,
-                   const uint8_t *d, size_t n) {
-                if (udp.get()) {
-                    udp->write(to, d, n);
+            [&udp_srv](const io_t::endpoint_t &to,
+                       const uint8_t *d, size_t n) {
+                if (udp_srv.get()) {
+                    udp_srv->write(to, d, n);
                 }
             },
             cfg.server_ca_file, cfg.server_cert_file, cfg.server_key_file,
@@ -202,6 +197,9 @@ int main(int argc, char **argv)
             std::chrono::seconds(cfg.idle_sec));
 
         ctx.srv = srv.get();
+        ctx.udp_srv = udp_srv.get();
+
+        udp_srv->set_user_data(srv.get());
         srv->set_user_data(&ctx);
         srv->set_verify_peer(cfg.server_verify_peer);
         srv->enable_debug();
@@ -209,11 +207,19 @@ int main(int argc, char **argv)
 
     if (cfg.mode != arg_opts_t::mode_t::SERVER) {
         io_t::endpoint_t remote{cfg.remote_ip, cfg.remote_port};
+
+        udp_cl = std::make_shared<udp_server_t>(0, [](const io_t::endpoint_t &from, const uint8_t *d, size_t n, io_t &self) {
+            dtls_client_t *cl = self.get_user_data<dtls_client_t>();
+            if (cl != nullptr) {
+                cl->handle_datagram(from, d, n);
+            }
+        });
+
         cli = std::make_shared<dtls_client_t>(
-            [&udp](const io_t::endpoint_t &to,
-                   const uint8_t *d, size_t n) {
-                if (udp.get()) {
-                    udp->write(to, d, n);
+            [&udp_cl](const io_t::endpoint_t &to,
+                      const uint8_t *d, size_t n) {
+                if (udp_cl.get()) {
+                    udp_cl->write(to, d, n);
                 }
             },
             remote,
@@ -223,15 +229,18 @@ int main(int argc, char **argv)
             std::chrono::seconds(cfg.idle_sec));
 
         ctx.cli = cli.get();
+        ctx.udp_cli = udp_cl.get();
+
+        udp_cl->set_user_data(cli.get());
         cli->set_user_data(&ctx);
         cli->set_verify_peer(cfg.client_verify_peer);
         cli->enable_debug();
     }
 
     tun->set_user_data(&ctx);
-    udp->set_user_data(&ctx);
 
-    spdlog::info("Running in {} mode", (cfg.mode == arg_opts_t::mode_t::SERVER ? "server" : cfg.mode == arg_opts_t::mode_t::CLIENT ? "client" : "bridge"));
+    spdlog::info("Running in {} mode", (cfg.mode == arg_opts_t::mode_t::SERVER ? "server" : cfg.mode == arg_opts_t::mode_t::CLIENT ? "client"
+                                                                                                                                   : "bridge"));
 
     std::unique_lock<std::mutex> lk{mu_};
     running_.wait(lk);
@@ -246,6 +255,13 @@ int main(int argc, char **argv)
         srv.reset();
     }
 
-    udp.reset();
+    if (udp_cl) {
+        udp_cl.reset();
+    }
+
+    if (udp_srv) {
+        udp_srv.reset();
+    }
+
     return 0;
 }

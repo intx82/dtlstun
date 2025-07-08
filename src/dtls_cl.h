@@ -290,14 +290,30 @@ class dtls_client_t : public io_t
 
     void pump_out()
     {
-        uint8_t buf[16384];
-        while (running_) {
-            std::lock_guard<std::mutex> lock(io_mu_);
-            int n = BIO_read(out_bio_, buf, sizeof(buf));
-            if (n <= 0) {
-                break;
+        while (BIO_ctrl_pending(out_bio_) > 0) {
+            unsigned char hdr[13];
+            {
+                std::lock_guard<std::mutex> lg(io_mu_);
+                int n = BIO_read(out_bio_, hdr, sizeof(hdr));
+                if (n != 13) {
+                    print_ssl_err("short hdr");
+                    break;
+                }
             }
-            send_(server_ep_, buf, (size_t)n);
+
+            unsigned rec_len = (hdr[11] << 8) | hdr[12];
+            std::vector<unsigned char> pkt(13 + rec_len);
+            memcpy(pkt.data(), hdr, 13);
+            {
+                std::lock_guard<std::mutex> lg(io_mu_);
+                int m = BIO_read(out_bio_, pkt.data() + 13, rec_len);
+                if (m != (int)rec_len) {
+                    print_ssl_err("short body");
+                    break;
+                }
+            }
+
+            send_(server_ep_, pkt.data(), pkt.size());
         }
     }
 

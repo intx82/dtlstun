@@ -158,13 +158,13 @@ arg_opts_t parse_args(int argc, char **argv)
         }
 
         if (opt.client_verify_peer) {
-            if (opt.server_cert_file.empty()) {
+            if (opt.client_cert_file.empty()) {
                 std::cerr << "Client side certificate required\n";
                 arg_usage(argv[0]);
                 std::exit(1);
             }
             
-            if (opt.server_key_file.empty()) {
+            if (opt.client_key_file.empty()) {
                 std::cerr << "Client side key required\n";
                 arg_usage(argv[0]);
                 std::exit(1);
