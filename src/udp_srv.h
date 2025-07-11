@@ -1,6 +1,7 @@
 #ifndef __UDP_H
 #define __UDP_H
 
+#include <spdlog/spdlog.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,8 +28,7 @@ public:
     explicit udp_server_t(uint16_t listen_port,
                           receive_callback cb,
                           size_t buf_size = 16384)
-        : cb_(std::move(cb)),
-          buf_size_(buf_size),
+          : buf_size_(buf_size),
           running_(true)
     {
 
@@ -37,6 +37,8 @@ public:
             throw std::runtime_error("socket() failed");
         }
 
+        set_rx_cb(cb);
+        set_state(state_t::CONNECTED);
         struct sockaddr_in sa = {};
         sa.sin_family = AF_INET;
         sa.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -96,11 +98,11 @@ public:
     udp_server_t(udp_server_t &&other) noexcept
         : sock_(other.sock_),
           efd_(other.efd_),
-          cb_(std::move(other.cb_)),
           thr_(std::move(other.thr_)),
           buf_size_(other.buf_size_),
           running_(other.running_.load())
     {
+        set_rx_cb(other.get_rx_cb());
         other.sock_ = -1;
         other.efd_ = -1;
         other.running_ = false;
@@ -190,9 +192,9 @@ private:
                     from.host = ip;
                     from.port = ntohs(peer.sin_port);
 
-                    if (cb_) {
+                    if (get_rx_cb()) {
                         spdlog::debug("UDP: Receive {}:{} size: {}", ip, from.port, n);
-                        cb_(from, buf.data(), (size_t)n, *this);
+                        get_rx_cb()(from, buf.data(), (size_t)n, *this);
                     }
                 }
             }
@@ -201,7 +203,6 @@ private:
 
     int sock_{-1};
     int efd_{-1};
-    receive_callback cb_;
     std::thread thr_;
     size_t buf_size_;
     std::atomic<bool> running_;
