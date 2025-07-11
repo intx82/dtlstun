@@ -15,6 +15,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -35,12 +36,10 @@ class dtls_client_t : public io_t
                   const std::string &ca_file,
                   const std::string &cert_file,
                   const std::string &key_file,
-                  receive_callback rx_cb,
                   size_t mtu = 1440,
                   std::chrono::seconds idle_to = 2min)
         : send_(std::move(send_cb)),
           server_ep_(std::move(server)),
-          rx_cb_(std::move(rx_cb)),
           idle_to_(idle_to),
           ca_file_(ca_file),
           cert_file_(cert_file),
@@ -100,7 +99,8 @@ class dtls_client_t : public io_t
     {
         spdlog::info("DTLS-Client exiting.. Sending Encrypted-Alert to the server");
         close_session();
-        
+        set_state(state_t::NOT_CONNECTED, server_ep_);
+
         running_.exchange(false);
         usleep(250000);  // just to receive server-side encrypted alert
 
@@ -113,6 +113,9 @@ class dtls_client_t : public io_t
             thr_.join();
         }
 
+        if (ctx_) {
+            SSL_CTX_free(ctx_);
+        }
         close(timer_fd_);
         close(efd_);
     }
@@ -121,9 +124,10 @@ class dtls_client_t : public io_t
     {
         spdlog::debug("dtls_client: Send DGRAM: {}:{} sz: {} State: {}", server_ep_.host, server_ep_.port, n, hs_names_[hs_state_]);
 
-        if (hs_state_ != HANDSHAKE_DONE) {
-            spdlog::debug("dtls_client: Timer: Re-arm handshake {}", hs_state_);
+        if (hs_state_ < HANDSHAKE_DONE) {
+            spdlog::debug("dtls_client: Timer: Re-arm handshake {}", hs_names_[hs_state_]);
             hs_state_ = HANDSHAKE_IN_PROGRESS;
+            set_state(state_t::CONNECTING, server_ep_);
             rearm_timer(100ms);
             return;
         }
@@ -152,7 +156,7 @@ class dtls_client_t : public io_t
             return;
         }
 
-        last_io_ = now();
+        //last_io_ = now();
         pump_out();
         spdlog::debug("dtls_client: Timer Re-arm write");
         rearm_timer(idle_to_);
@@ -167,7 +171,6 @@ class dtls_client_t : public io_t
         spdlog::debug("dtls_client: Receive DGRAM: {}:{} sz: {} State: {}", from.host, from.port, len, hs_names_[hs_state_]);
         if ((ssl_ != nullptr ) && (hs_state_ != handshake_state_t::HANDSHAKE_NOT_STARTED)) {
 
-            std::lock_guard<std::mutex> lock(io_mu_);
             if (BIO_write(in_bio_, d, (int)len) != (int)len) {
                 print_ssl_err("BIO_write");
                 return;
@@ -239,6 +242,7 @@ class dtls_client_t : public io_t
         SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
         SSL_set_connect_state(ssl_);
         hs_state_ = handshake_state_t::HANDSHAKE_IN_PROGRESS;
+        set_state(state_t::CONNECTING, server_ep_);
     }
 
     void do_handshake()
@@ -250,6 +254,7 @@ class dtls_client_t : public io_t
         int ret = SSL_do_handshake(ssl_);
         if (ret == 1) {
             hs_state_ = handshake_state_t::HANDSHAKE_DONE;
+            set_state(state_t::CONNECTED, server_ep_);
             spdlog::info("dtls_client: Handshake done {}:{} ", server_ep_.host, server_ep_.port);
         } else {
             int err = SSL_get_error(ssl_, ret);
@@ -282,8 +287,8 @@ class dtls_client_t : public io_t
                 break;
             }
 
-            if (rx_cb_) {
-                rx_cb_(server_ep_, buf, (size_t)n, *this);
+            if (get_rx_cb()) {
+                get_rx_cb()(server_ep_, buf, (size_t)n, *this);
             }
         }
     }
@@ -293,7 +298,6 @@ class dtls_client_t : public io_t
         while (BIO_ctrl_pending(out_bio_) > 0) {
             unsigned char hdr[13];
             {
-                std::lock_guard<std::mutex> lg(io_mu_);
                 int n = BIO_read(out_bio_, hdr, sizeof(hdr));
                 if (n != 13) {
                     print_ssl_err("short hdr");
@@ -305,7 +309,6 @@ class dtls_client_t : public io_t
             std::vector<unsigned char> pkt(13 + rec_len);
             memcpy(pkt.data(), hdr, 13);
             {
-                std::lock_guard<std::mutex> lg(io_mu_);
                 int m = BIO_read(out_bio_, pkt.data() + 13, rec_len);
                 if (m != (int)rec_len) {
                     print_ssl_err("short body");
@@ -384,6 +387,7 @@ class dtls_client_t : public io_t
             do_handshake();
             rearm_timer(100ms);
         } else if (hs_state_ == handshake_state_t::SESSION_CLOSING) {
+            set_state(state_t::NOT_CONNECTED, server_ep_);
 
             if (ssl_) {
                 if (!(SSL_get_shutdown(ssl_) & SSL_SENT_SHUTDOWN)) {
@@ -443,7 +447,6 @@ class dtls_client_t : public io_t
 
     send_callback send_;
     endpoint_t server_ep_;
-    receive_callback rx_cb_;
 
     SSL_CTX *ctx_{nullptr};
     SSL *ssl_{nullptr};
@@ -453,7 +456,6 @@ class dtls_client_t : public io_t
     handshake_state_t hs_state_{handshake_state_t::HANDSHAKE_NOT_STARTED};
     clk::time_point last_io_{now()};
     std::chrono::seconds idle_to_;
-    std::mutex io_mu_;
 
     const std::string &ca_file_;
     const std::string &cert_file_;
@@ -476,6 +478,7 @@ class dtls_client_t : public io_t
    private:
     static void info_cb(const SSL *ssl, int where, int ret)
     {
+        (void)ret;
         const char *str;
         int w = where & ~SSL_ST_MASK;
 
@@ -515,6 +518,11 @@ class dtls_client_t : public io_t
     static void msg_cb(int write_p, int ver, int content_type,
                        const void *buf, size_t len, SSL *ssl, void *arg)
     {
+
+        (void)arg;
+        (void)ssl;
+        (void)buf;
+        (void)ver;
         const char *dir = write_p ? ">" : "<";
         const char *ct = rt_name(content_type);
 
