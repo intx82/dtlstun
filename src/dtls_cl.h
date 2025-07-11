@@ -35,12 +35,10 @@ class dtls_client_t : public io_t
                   const std::string &ca_file,
                   const std::string &cert_file,
                   const std::string &key_file,
-                  receive_callback rx_cb,
                   size_t mtu = 1440,
                   std::chrono::seconds idle_to = 2min)
         : send_(std::move(send_cb)),
           server_ep_(std::move(server)),
-          rx_cb_(std::move(rx_cb)),
           idle_to_(idle_to),
           ca_file_(ca_file),
           cert_file_(cert_file),
@@ -100,7 +98,8 @@ class dtls_client_t : public io_t
     {
         spdlog::info("DTLS-Client exiting.. Sending Encrypted-Alert to the server");
         close_session();
-        
+        set_state(state_t::EXITING);
+
         running_.exchange(false);
         usleep(250000);  // just to receive server-side encrypted alert
 
@@ -124,6 +123,7 @@ class dtls_client_t : public io_t
         if (hs_state_ != HANDSHAKE_DONE) {
             spdlog::debug("dtls_client: Timer: Re-arm handshake {}", hs_state_);
             hs_state_ = HANDSHAKE_IN_PROGRESS;
+            set_state(state_t::CONNECTING);
             rearm_timer(100ms);
             return;
         }
@@ -239,6 +239,7 @@ class dtls_client_t : public io_t
         SSL_set_mode(ssl_, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_ENABLE_PARTIAL_WRITE);
         SSL_set_connect_state(ssl_);
         hs_state_ = handshake_state_t::HANDSHAKE_IN_PROGRESS;
+        set_state(state_t::CONNECTING);
     }
 
     void do_handshake()
@@ -250,6 +251,7 @@ class dtls_client_t : public io_t
         int ret = SSL_do_handshake(ssl_);
         if (ret == 1) {
             hs_state_ = handshake_state_t::HANDSHAKE_DONE;
+            set_state(state_t::CONNECTED);
             spdlog::info("dtls_client: Handshake done {}:{} ", server_ep_.host, server_ep_.port);
         } else {
             int err = SSL_get_error(ssl_, ret);
@@ -282,8 +284,8 @@ class dtls_client_t : public io_t
                 break;
             }
 
-            if (rx_cb_) {
-                rx_cb_(server_ep_, buf, (size_t)n, *this);
+            if (get_rx_cb()) {
+                get_rx_cb()(server_ep_, buf, (size_t)n, *this);
             }
         }
     }
@@ -395,6 +397,7 @@ class dtls_client_t : public io_t
             }
 
             hs_state_ = handshake_state_t::HANDSHAKE_NOT_STARTED;
+            set_state(state_t::NOT_CONNECTED);
             rearm_timer(idle_to_);
         } else if ((hs_state_ == handshake_state_t::HANDSHAKE_DONE) || (hs_state_ == HANDSHAKE_NOT_STARTED)) {
             rearm_timer(idle_to_);
@@ -405,6 +408,7 @@ class dtls_client_t : public io_t
     {
         spdlog::warn("dtls_client: Session close {}:{}", server_ep_.host, server_ep_.port);
         hs_state_ = SESSION_CLOSING;
+        set_state(state_t::NOT_CONNECTED);
         rearm_timer(100ms);
     }
 
@@ -443,7 +447,6 @@ class dtls_client_t : public io_t
 
     send_callback send_;
     endpoint_t server_ep_;
-    receive_callback rx_cb_;
 
     SSL_CTX *ctx_{nullptr};
     SSL *ssl_{nullptr};

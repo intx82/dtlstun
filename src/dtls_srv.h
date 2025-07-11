@@ -34,15 +34,14 @@ class dtls_server_t : public io_t
                   const std::string &ca_file,
                   const std::string &cert_file,
                   const std::string &key_file,
-                  receive_callback app_cb,
                   size_t mtu = 1440,
                   std::chrono::steady_clock::duration idle_limit =
                       std::chrono::minutes(2))
         : send_(std::move(transport_send)),
-          app_cb_(std::move(app_cb)),
           mtu_(mtu),
           idle_limit_(idle_limit)
     {
+        set_state(state_t::CONNECTED);
         init_openssl();
         load_credentials(ca_file, cert_file, key_file);
         setup_timer_thread();
@@ -132,6 +131,7 @@ class dtls_server_t : public io_t
             int ret = SSL_do_handshake(s->ssl);
             if (ret == 1) {
                 s->hs_done = true;
+                set_state(state_t::CONNECTED);
             } else if (ret == 0) {
                 update_ssl_timer(*s);
                 pump_out_bio(*s, from);
@@ -169,7 +169,7 @@ class dtls_server_t : public io_t
                 }
                 break;
             }
-            app_cb_(from, buf, (size_t)n, *this);
+            get_rx_cb()(from, buf, (size_t)n, *this);
         }
         update_ssl_timer(*s);
         pump_out_bio(*s, from);
@@ -178,27 +178,31 @@ class dtls_server_t : public io_t
 
     void write(const io_t::endpoint_t &to, const uint8_t *data, size_t len) override
     {
-        std::lock_guard<std::mutex> lg(mu_);
-        auto it = sessions_.find(key(to));
-        if (it == sessions_.end()) {
-            spdlog::warn("dtls_server: no session for {}:{}", to.host, to.port);
-            return;
-        }
-        session &s = *it->second;
-        int ret = SSL_write(s.ssl, data, (int)len);
-        if (ret <= 0) {
-            int err = SSL_get_error(s.ssl, ret);
-            if (err == SSL_ERROR_ZERO_RETURN) {
-                close_and_erase(to, it->second);
-            } else if (err != SSL_ERROR_WANT_WRITE &&
-                       err != SSL_ERROR_WANT_READ) {
-                print_ssl_error("SSL_write");
+        if (to.host.empty() && to.port == 0) {
+            broadcast(data, len);
+        } else {
+            std::lock_guard<std::mutex> lg(mu_);
+            auto it = sessions_.find(key(to));
+            if (it == sessions_.end()) {
+                spdlog::warn("dtls_server: no session for {}:{}", to.host, to.port);
+                return;
             }
-            return;
+            session &s = *it->second;
+            int ret = SSL_write(s.ssl, data, (int)len);
+            if (ret <= 0) {
+                int err = SSL_get_error(s.ssl, ret);
+                if (err == SSL_ERROR_ZERO_RETURN) {
+                    close_and_erase(to, it->second);
+                } else if (err != SSL_ERROR_WANT_WRITE &&
+                        err != SSL_ERROR_WANT_READ) {
+                    print_ssl_error("SSL_write");
+                }
+                return;
+            }
+            update_ssl_timer(s);
+            pump_out_bio(s, to);
+            arm_timerfd();
         }
-        update_ssl_timer(s);
-        pump_out_bio(s, to);
-        arm_timerfd();
     }
 
     void broadcast(const uint8_t *data,
@@ -505,6 +509,8 @@ class dtls_server_t : public io_t
         spdlog::warn("dtls_server: Closing session for: {}:{}", ep.host, ep.port);
         session &s = *up;
         if (s.hs_done) {
+            set_state(state_t::NOT_CONNECTED);
+
             if (!(SSL_get_shutdown(s.ssl) & SSL_SENT_SHUTDOWN)) {
                 SSL_shutdown(s.ssl);
                 pump_out_bio(s, ep);
@@ -516,7 +522,6 @@ class dtls_server_t : public io_t
 
     SSL_CTX *ctx_{nullptr};
     send_callback send_;
-    receive_callback app_cb_;
     size_t mtu_;
     std::chrono::steady_clock::duration idle_limit_;
 

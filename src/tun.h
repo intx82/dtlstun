@@ -30,13 +30,11 @@ class tun_if_t : public io_t
 {
    public:
     tun_if_t(std::string name,
-             receive_callback rx_cb,
              std::uint16_t mtu = 1440,  // 1536 - 14 - 20 - 8 - 13 - ... = ~1440
              std::string ip = "",
              uint8_t cidr = 24,
              unsigned queues = 1)
-        : rx_cb_(std::move(rx_cb)),
-          ip_(ip),
+        : ip_(ip),
           mtu_(mtu),
           running_(true)
     {
@@ -44,6 +42,7 @@ class tun_if_t : public io_t
             queues = 1;
         }
 
+        set_state(state_t::CONNECTED);
         fds_.reserve(queues);
         rx_thr_.reserve(queues);
 
@@ -249,9 +248,9 @@ class tun_if_t : public io_t
             }
 
             static endpoint_t null_ep{};
-            if (rx_cb_) {
+            if (get_rx_cb()) {
                 spdlog::debug("TUN: Receive {} bytes", n);
-                rx_cb_(null_ep, buf.data(), static_cast<size_t>(n), *this);
+                get_rx_cb()(null_ep, buf.data(), static_cast<size_t>(n), *this);
             }
         }
     }
@@ -259,7 +258,6 @@ class tun_if_t : public io_t
     std::string if_name_;
     std::vector<int> fds_;
     std::vector<std::thread> rx_thr_;
-    receive_callback rx_cb_;
     std::string ip_;
     std::uint16_t mtu_;
     size_t buf_len_;
