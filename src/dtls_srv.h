@@ -34,15 +34,14 @@ class dtls_server_t : public io_t
                   const std::string &ca_file,
                   const std::string &cert_file,
                   const std::string &key_file,
-                  receive_callback app_cb,
                   size_t mtu = 1440,
                   std::chrono::steady_clock::duration idle_limit =
                       std::chrono::minutes(2))
         : send_(std::move(transport_send)),
-          app_cb_(std::move(app_cb)),
           mtu_(mtu),
           idle_limit_(idle_limit)
     {
+        set_state(state_t::CONNECTED);
         init_openssl();
         load_credentials(ca_file, cert_file, key_file);
         setup_timer_thread();
@@ -78,28 +77,16 @@ class dtls_server_t : public io_t
             endpoint_t ep = parse_key(kv.first);
 
             session &s = *kv.second;
-            if (!s.hs_done) {
-                continue;
-            }
-
-            if (s.hs_done) {
-                SSL_shutdown(s.ssl);
-                pump_out_bio(s, ep);
-            }
+            s.state = SESSION_CLOSING;
         }
 
         usleep(250000);  // to receive encrypted alert from clients
 
         running_ = false;
-        uint64_t one = 1;
-        ::write(exit_fd_, &one, sizeof(one));
+        arm_timerfd(now() + 100ms);
 
         if (thr_.joinable()) {
             thr_.join();
-        }
-
-        for (auto &kv : sessions_) {
-            free_session(kv.second);
         }
 
         SSL_CTX_free(ctx_);
@@ -114,7 +101,7 @@ class dtls_server_t : public io_t
     {
         session *s = nullptr;
         {
-            std::lock_guard<std::mutex> lg(mu_);
+            std::lock_guard<std::recursive_mutex> lg(mu_);
             s = get_or_create_session(from);
         }
         if (!s)
@@ -128,29 +115,32 @@ class dtls_server_t : public io_t
         }
         s->last_rx = now();
 
-        if (!s->hs_done) {
+
+        if (s->state == HANDSHAKE_IN_PROGRESS) {
             int ret = SSL_do_handshake(s->ssl);
-            if (ret == 1) {
-                s->hs_done = true;
-            } else if (ret == 0) {
+            if (ret == 0) {
                 update_ssl_timer(*s);
                 pump_out_bio(*s, from);
                 arm_timerfd();
                 return;
-            } else {
+            } else if (ret < 0) {
                 int err = SSL_get_error(s->ssl, ret);
                 if ((err == SSL_ERROR_WANT_READ) || (err == SSL_ERROR_WANT_WRITE)) {
                     update_ssl_timer(*s);
                     pump_out_bio(*s, from);
                     arm_timerfd();
-                    return;
+                } else {
+                    s->state = SESSION_CLOSING;
+                    print_ssl_error("SSL_do_handshake");
                 }
-                print_ssl_error("SSL_do_handshake");
                 return;
+            } else {
+                s->state = HANDSHAKE_DONE;
+                set_state(CONNECTED, from);
             }
         }
 
-        while (true) { /* decrypt app data */
+        while (true) {
             uint8_t buf[16384];
             int n = SSL_read(s->ssl, buf, sizeof(buf));
             if (n <= 0) {
@@ -162,50 +152,58 @@ class dtls_server_t : public io_t
                 }
 
                 if (SSL_get_shutdown(s->ssl) & SSL_RECEIVED_SHUTDOWN) {
-                    std::lock_guard<std::mutex> lg(mu_);
+                    std::lock_guard<std::recursive_mutex> lg(mu_);
                     close_and_erase(from, sessions_.find(key(from))->second);
-                    arm_timerfd();
                     return;
                 }
                 break;
             }
-            app_cb_(from, buf, (size_t)n, *this);
+            get_rx_cb()(from, buf, (size_t)n, *this);
         }
         update_ssl_timer(*s);
         pump_out_bio(*s, from);
-        arm_timerfd();
+        arm_timerfd(s->state != HANDSHAKE_DONE ? now() + 100ms : clk::time_point::max());
     }
 
     void write(const io_t::endpoint_t &to, const uint8_t *data, size_t len) override
     {
-        std::lock_guard<std::mutex> lg(mu_);
-        auto it = sessions_.find(key(to));
-        if (it == sessions_.end()) {
-            spdlog::warn("dtls_server: no session for {}:{}", to.host, to.port);
-            return;
-        }
-        session &s = *it->second;
-        int ret = SSL_write(s.ssl, data, (int)len);
-        if (ret <= 0) {
-            int err = SSL_get_error(s.ssl, ret);
-            if (err == SSL_ERROR_ZERO_RETURN) {
-                close_and_erase(to, it->second);
-            } else if (err != SSL_ERROR_WANT_WRITE &&
-                       err != SSL_ERROR_WANT_READ) {
-                print_ssl_error("SSL_write");
+        if (to.host.empty() && to.port == 0) {
+            broadcast(data, len);
+        } else {
+            std::lock_guard<std::recursive_mutex> lg(mu_);
+            auto it = sessions_.find(key(to));
+            if (it == sessions_.end()) {
+                spdlog::warn("dtls_server: no session for {}:{}", to.host, to.port);
+                return;
             }
-            return;
+            session &s = *it->second;
+
+            if (s.state == HANDSHAKE_IN_PROGRESS) {
+                return;
+            }
+
+            int ret = SSL_write(s.ssl, data, (int)len);
+            if (ret <= 0) {
+                int err = SSL_get_error(s.ssl, ret);
+                if (err == SSL_ERROR_ZERO_RETURN) {
+                    close_and_erase(to, it->second);
+                } else if (err != SSL_ERROR_WANT_WRITE &&
+                        err != SSL_ERROR_WANT_READ) {
+                    print_ssl_error("SSL_write");
+                }
+                return;
+            }
+            update_ssl_timer(s);
+            pump_out_bio(s, to);
+            arm_timerfd();
         }
-        update_ssl_timer(s);
-        pump_out_bio(s, to);
-        arm_timerfd();
     }
 
     void broadcast(const uint8_t *data,
                    size_t len,
                    const endpoint_t *except = nullptr)
     {
-        std::lock_guard<std::mutex> lg(mu_);
+        std::lock_guard<std::recursive_mutex> lg(mu_);
 
         for (auto &kv : sessions_) {
             endpoint_t ep = parse_key(kv.first);
@@ -217,7 +215,7 @@ class dtls_server_t : public io_t
             }
 
             session &s = *kv.second;
-            if (!s.hs_done) {
+            if (s.state != HANDSHAKE_DONE) {
                 continue;
             }
 
@@ -226,8 +224,7 @@ class dtls_server_t : public io_t
                 int err = SSL_get_error(s.ssl, ret);
                 if (err == SSL_ERROR_ZERO_RETURN) {
                     close_and_erase(ep, kv.second);
-                } else if (err != SSL_ERROR_WANT_READ &&
-                           err != SSL_ERROR_WANT_WRITE) {
+                } else if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE) {
                     print_ssl_error("SSL_write");
                 }
                 continue;
@@ -239,6 +236,19 @@ class dtls_server_t : public io_t
     }
 
    private:
+    enum handshake_state_t {
+        HANDSHAKE_IN_PROGRESS,
+        HANDSHAKE_DONE,
+        SESSION_CLOSING,
+        HANDSHAKE_MAX
+    };
+
+    const std::string hs_names_[handshake_state_t::HANDSHAKE_MAX] = {
+        "Handshake in progress",
+        "Session established",
+        "Session closing"
+    };
+
     using clk = std::chrono::steady_clock;
     static clk::time_point now() { return clk::now(); }
 
@@ -246,7 +256,7 @@ class dtls_server_t : public io_t
         SSL *ssl = nullptr;
         BIO *in = nullptr;
         BIO *out = nullptr;
-        bool hs_done = false;
+        handshake_state_t state = HANDSHAKE_IN_PROGRESS;
         clk::time_point last_rx;
         clk::time_point ssl_deadline{clk::time_point::max()};
     };
@@ -380,10 +390,8 @@ class dtls_server_t : public io_t
         });
     }
 
-    void arm_timerfd()
+    void arm_timerfd(clk::time_point earliest = clk::time_point::max())
     {
-        clk::time_point earliest = clk::time_point::max();
-
         for (auto &kv : sessions_) {
             const session &s = *kv.second;
             earliest = std::min(earliest, s.ssl_deadline);
@@ -436,31 +444,38 @@ class dtls_server_t : public io_t
     void on_tick()
     {
         auto now_tp = now();
-        std::lock_guard<std::mutex> lg(mu_);
+        std::lock_guard<std::recursive_mutex> lg(mu_);
 
         for (auto it = sessions_.begin(); it != sessions_.end();) {
             session &s = *it->second;
-            bool erase = false;
+            bool erase = s.state == SESSION_CLOSING;
+            io_t::endpoint_t ep = parse_key(it->first);
+            spdlog::debug("dtsl_server. Host: {}:{} state: {}", ep.host, ep.port, hs_names_[s.state]);
 
-            if (now_tp >= s.ssl_deadline) {
+            if (!erase && now_tp >= s.ssl_deadline) {
                 if (DTLSv1_handle_timeout(s.ssl) <= 0) {
                     print_ssl_error("handle_timeout");
                     erase = true;
                 } else {
                     update_ssl_timer(s);
-                    io_t::endpoint_t ep = parse_key(it->first);
                     pump_out_bio(s, ep);
                 }
             }
 
-            if (now_tp - s.last_rx > idle_limit_) {
+
+            if (!erase && (now_tp - s.last_rx > idle_limit_)) {
                 close_and_erase(parse_key(it->first), it->second);
-                arm_timerfd();
                 return;
             }
 
             if (erase) {
+                SSL_shutdown(s.ssl);
+                pump_out_bio(s,ep);
+
+                free_session(it->second);
                 it = sessions_.erase(it);
+
+                spdlog::warn("dtls_server: Session for: {}:{} closed", ep.host, ep.port);
             } else {
                 ++it;
             }
@@ -502,26 +517,20 @@ class dtls_server_t : public io_t
     void close_and_erase(const io_t::endpoint_t &ep,
                          std::unique_ptr<session> &up)
     {
-        spdlog::warn("dtls_server: Closing session for: {}:{}", ep.host, ep.port);
+        spdlog::debug("dtls_server: Closing session for: {}:{}", ep.host, ep.port);
         session &s = *up;
-        if (s.hs_done) {
-            if (!(SSL_get_shutdown(s.ssl) & SSL_SENT_SHUTDOWN)) {
-                SSL_shutdown(s.ssl);
-                pump_out_bio(s, ep);
-            }
-        }
-        free_session(up);
-        sessions_.erase(key(ep));
+        set_state(NOT_CONNECTED, ep);
+        s.state = SESSION_CLOSING;
+        arm_timerfd(now() + 100ms);
     }
 
     SSL_CTX *ctx_{nullptr};
     send_callback send_;
-    receive_callback app_cb_;
     size_t mtu_;
     std::chrono::steady_clock::duration idle_limit_;
 
     std::unordered_map<std::string, std::unique_ptr<session>> sessions_;
-    std::mutex mu_;
+    std::recursive_mutex mu_;
     std::mutex io_mu_;
 
     int efd_{-1}, timer_fd_{-1}, exit_fd_{-1};
@@ -539,6 +548,7 @@ class dtls_server_t : public io_t
    private:
     static void info_cb(const SSL *ssl, int where, int ret)
     {
+        (void)ret;
         const char *str;
         int w = where & ~SSL_ST_MASK;
 
@@ -552,7 +562,7 @@ class dtls_server_t : public io_t
             str = "undefined";
         }
 
-        spdlog::debug("dtls_client: {}: {}", str, SSL_state_string_long(ssl));
+        spdlog::debug("dtls_server: {}: {}", str, SSL_state_string_long(ssl));
     }
 
     static const char *rt_name(int ct)
@@ -571,13 +581,17 @@ class dtls_server_t : public io_t
                 return "HB";
 #endif
             default:
-                return "??";
+                return "--";
         }
     }
 
     static void msg_cb(int write_p, int ver, int content_type,
                        const void *buf, size_t len, SSL *ssl, void *arg)
     {
+        (void)arg;
+        (void)ssl;
+        (void)buf;
+        (void)ver;
         const char *dir = write_p ? ">" : "<";
         const char *ct = rt_name(content_type);
 

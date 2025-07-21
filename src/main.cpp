@@ -14,30 +14,33 @@
 #include "dtls_srv.h"
 #include "tun.h"
 #include "udp_srv.h"
+#include "routing.h"
 
 static std::mutex mu_;
 static std::condition_variable running_;
 
 void print_hex(const uint8_t *buf, int sz)
 {
-    for (int idx = 0; idx < sz; idx += 16) {
-        int idx_r = idx;
-        printf("%04x: ", idx);
-        for (; idx_r < sz && idx_r < idx + 16; idx_r++) {
-            printf("%02x ", buf[idx_r]);
-        }
+    if (spdlog::get_level() <= SPDLOG_LEVEL_DEBUG) {
+        for (int idx = 0; idx < sz; idx += 16) {
+            int idx_r = idx;
+            printf("%04x: ", idx);
+            for (; idx_r < sz && idx_r < idx + 16; idx_r++) {
+                printf("%02x ", buf[idx_r]);
+            }
 
-        if (idx_r < idx + 16) {
-            for (int idx_s = 0; idx_s < ((idx + 16) - idx_r); idx_s++)
-                printf("   ");
-        }
+            if (idx_r < idx + 16) {
+                for (int idx_s = 0; idx_s < ((idx + 16) - idx_r); idx_s++)
+                    printf("   ");
+            }
 
-        for (idx_r = idx; idx_r < sz && idx_r < idx + 16; idx_r++) {
-            printf((buf[idx_r] >= ' ' && buf[idx_r] <= '~') ? "%c" : "·", buf[idx_r]);
+            for (idx_r = idx; idx_r < sz && idx_r < idx + 16; idx_r++) {
+                printf((buf[idx_r] >= ' ' && buf[idx_r] <= '~') ? "%c" : "·", buf[idx_r]);
+            }
+            printf("\r\n");
         }
         printf("\r\n");
     }
-    printf("\r\n");
 }
 
 static void daemonize()
@@ -89,59 +92,10 @@ struct bridge_ctx_t {
     tun_if_t *tun{nullptr};
 };
 
-static void tun_rx_cb(const io_t::endpoint_t &, const uint8_t *d, size_t n, io_t &self)
-{
-    // printf("[TUN] > \n");
-    // print_hex(d, n);
-
-    if (auto ctx = self.get_user_data<bridge_ctx_t>(); ctx != nullptr) {
-        if (ctx->srv != nullptr) {
-            ctx->srv->broadcast(d, n, nullptr);
-        }
-        if (ctx->cli != nullptr) {
-            ctx->cli->write({}, d, n);
-        }
-    }
-}
-
-static void srv_app_cb(const io_t::endpoint_t &from, const uint8_t *p, size_t n, io_t &self)
-{
-    // printf("[DTLS-SRV] %s:%d >\n", from.host.c_str(), from.port);
-    // print_hex(p, n);
-
-    if (auto ctx = self.get_user_data<bridge_ctx_t>(); ctx != nullptr) {
-        if (ctx->tun != nullptr) {
-            ctx->tun->write({}, p, n);
-        }
-
-        if (ctx->cli != nullptr) {
-            ctx->cli->write({}, p, n);
-        }
-
-        if (ctx->srv != nullptr) {
-            ctx->srv->broadcast(p, n, &from);
-        }
-    }
-}
-
-static void cli_app_cb(const io_t::endpoint_t &, const uint8_t *p, size_t n, io_t &self)
-{
-    // printf("[DTLS-CL] > \n");
-    // print_hex(p, n);
-
-    if (auto ctx = self.get_user_data<bridge_ctx_t>(); ctx != nullptr) {
-        if (ctx->tun != nullptr) {
-            ctx->tun->write({}, p, n);
-        }
-
-        if (ctx->srv != nullptr) {
-            ctx->srv->broadcast(p, n);
-        }
-    }
-}
 
 static void kill_app(int sig)
 {
+    (void)sig;
     running_.notify_all();
 }
 
@@ -165,7 +119,14 @@ int main(int argc, char **argv)
         daemonize();
     }
 
-    auto tun = std::make_shared<tun_if_t>(cfg.tun_name, tun_rx_cb, cfg.mtu, cfg.tun_ip, cfg.tun_cidr);
+    routing_t router;
+    auto tun = std::make_shared<tun_if_t>(cfg.tun_name, cfg.mtu, cfg.tun_ip, cfg.tun_cidr);
+    std::optional<ip_addr_t> ip = ip_addr_t::parse(cfg.tun_ip);
+    if (ip) {
+        router.register_local_io(tun.get(), ip.value());
+    } else {
+        throw std::runtime_error("Can't parse tun_ip");
+    }
 
     std::shared_ptr<dtls_server_t> srv;
     std::shared_ptr<udp_server_t> udp_srv;
@@ -192,13 +153,12 @@ int main(int argc, char **argv)
                 }
             },
             cfg.server_ca_file, cfg.server_cert_file, cfg.server_key_file,
-            srv_app_cb,
             cfg.mtu,
             std::chrono::seconds(cfg.idle_sec));
 
         ctx.srv = srv.get();
         ctx.udp_srv = udp_srv.get();
-
+        router.register_io(srv.get());
         udp_srv->set_user_data(srv.get());
         srv->set_user_data(&ctx);
         srv->set_verify_peer(cfg.server_verify_peer);
@@ -224,7 +184,6 @@ int main(int argc, char **argv)
             },
             remote,
             cfg.client_ca_file, cfg.client_cert_file, cfg.client_key_file,
-            cli_app_cb,
             cfg.mtu,
             std::chrono::seconds(cfg.idle_sec));
 
@@ -235,6 +194,7 @@ int main(int argc, char **argv)
         cli->set_user_data(&ctx);
         cli->set_verify_peer(cfg.client_verify_peer);
         cli->enable_debug();
+        router.register_io(cli.get());
     }
 
     tun->set_user_data(&ctx);
@@ -245,6 +205,8 @@ int main(int argc, char **argv)
     std::unique_lock<std::mutex> lk{mu_};
     running_.wait(lk);
     spdlog::warn("Catch SIGKILL/SIGINT signal. Exiting..");
+
+    router.stop();
     tun.reset();
 
     if (cli) {
