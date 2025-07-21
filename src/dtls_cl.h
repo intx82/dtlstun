@@ -158,8 +158,6 @@ class dtls_client_t : public io_t
 
         //last_io_ = now();
         pump_out();
-        spdlog::debug("dtls_client: Timer Re-arm write");
-        rearm_timer(idle_to_);
     }
 
     void handle_datagram(const endpoint_t &from, const uint8_t *d, size_t len)
@@ -401,6 +399,13 @@ class dtls_client_t : public io_t
             hs_state_ = handshake_state_t::HANDSHAKE_NOT_STARTED;
             rearm_timer(idle_to_);
         } else if ((hs_state_ == handshake_state_t::HANDSHAKE_DONE) || (hs_state_ == HANDSHAKE_NOT_STARTED)) {
+            if (hs_state_ == handshake_state_t::HANDSHAKE_DONE) {
+                if (now() > (last_io_ + idle_to_)) {
+                    hs_state_ = handshake_state_t::HANDSHAKE_IN_PROGRESS;
+                    rearm_timer(100ms);
+                    return;
+                }
+            }
             rearm_timer(idle_to_);
         }
     }

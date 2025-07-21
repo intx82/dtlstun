@@ -155,7 +155,7 @@ void routing_t::register_local_io(io_t *iface, const ip_addr_t &my_ip)
     my_ip_ = my_ip;
     tun_iface_ = iface;
     iface->set_rx_cb(rx_cb);
-    (*this)[my_ip] = routing_entry_t{{}, iface, true};
+    (*this)[my_ip] = routing_entry_t{{}, iface, 1};
 }
 
 void routing_t::handle_datagram(const io_t::endpoint_t &from, const uint8_t *pkt, size_t len, io_t &ingress)
@@ -183,10 +183,15 @@ void routing_t::handle_datagram(const io_t::endpoint_t &from, const uint8_t *pkt
         spdlog::debug("routing: Route IPv4 packet to: {} from: {} (via {}:{})", dst.to_string(), src.to_string(), from.host, from.port);
 
         if (src != my_ip_) {
-            std::unique_lock lk(mu_);
-            (*this)[src] = routing_entry_t{from, &ingress, false};
+            add_route(src, from, ingress, -1);
         } else if ((src == my_ip_) && (&ingress != tun_iface_)) {
             spdlog::debug("routing: Drop. Found own ip in source, and it came not from TUN");
+            return;
+        }
+
+        if (h->ttl == 1) {
+            icmp_advert_process(from, pkt, len, ingress);
+            spdlog::debug("routing: Drop. TTL = 0");
             return;
         }
 
@@ -266,15 +271,62 @@ uint16_t routing_t::icmp_checksum(const void *data, std::size_t len)
     return static_cast<uint16_t>(~sum);
 }
 
+void routing_t::add_route(ip_addr_t &src, const io_t::endpoint_t &from, io_t &ingress, int32_t prio)
+{
+    if (src != my_ip_) {
+        std::unique_lock lk(mu_);
+        auto it = find(src);
+        if (it == end()) {
+            spdlog::info("routing: Add new route: {} via {}:{} prio: {}", src.to_string(), from.host, from.port, prio);
+            (*this)[src] = routing_entry_t{from, &ingress, 0};
+        } else if ((*this)[src].prio <= prio) {
+            (*this)[src] = routing_entry_t{from, &ingress, prio};
+        }
+    }
+}
+
+void routing_t::icmp_advert_process(const io_t::endpoint_t &from, const uint8_t *pkt, size_t len, io_t &ingress)
+{
+    auto ip = reinterpret_cast<const iphdr *>(pkt);
+    if (ip->version == 4 && ip->protocol != IPPROTO_ICMP) {
+        return;
+    }
+
+    if (len < (size_t)(ip->ihl << 2)) {
+        return;
+    }
+
+    auto icmp = reinterpret_cast<const icmphdr *>(&pkt[ip->ihl << 2]);
+    if (icmp->type != ICMP_ROUTERADVERT || icmp->code != 0) {
+        return;
+    }
+
+    const uint8_t *ra = reinterpret_cast<const uint8_t *>(icmp) + offsetof(iphdr, id);
+    uint8_t count = ra[0];
+
+    if (ra[1] != 2) {
+        return;
+    }
+
+    const uint32_t *entry = reinterpret_cast<const uint32_t *>(ra + 4);
+
+    for (int idx = 0; idx < count; idx++) {
+        auto src = ip_addr_t::v4(entry[idx << 1]);
+        int32_t prio = entry[(idx << 1) + 1];
+
+        add_route(src, from, ingress, prio);
+    }
+}
+
 void routing_t::send_router_discovery()
 {
-    uint8_t pkt[sizeof(iphdr) + 4 + 4 + 8]{};
+    uint8_t pkt[sizeof(iphdr) + 4 + 4 + this->size() * 8]{};
 
     auto ip = reinterpret_cast<iphdr *>(pkt);
 
     ip->ihl = 5;
     ip->version = 4;
-    ip->ttl = 255;
+    ip->ttl = 1;
     ip->protocol = IPPROTO_ICMP;
     ip->tot_len = htons(sizeof(pkt));
     memcpy((uint8_t *)&ip->saddr, my_ip_.buf, 4);
@@ -285,13 +337,22 @@ void routing_t::send_router_discovery()
     icmp->code = 0;
 
     uint8_t *ra = reinterpret_cast<uint8_t *>(icmp) + offsetof(iphdr, id);
-    ra[0] = 1;  //  Num Addrs
-    ra[1] = 2;  // Addr Entry Size
+    ra[0] = this->size();  //  Num Addrs
+    ra[1] = 2;             // Addr Entry Size
     *reinterpret_cast<uint16_t *>(ra + 2) = htons(120);
 
     uint32_t *entry = reinterpret_cast<uint32_t *>(ra + 4);
-    memcpy((uint8_t *)&entry[0], my_ip_.buf, 4);
-    entry[1] = 0;
+
+    int idx = 0;
+    for (auto &a : *this) {
+        const ip_addr_t &addr = std::get<0>(a);
+        auto &route = std::get<1>(a);
+        if (addr.len == 4) {
+            memcpy((uint8_t *)&entry[idx], addr.buf, 4);
+            entry[idx + 1] = route.prio - 1;
+            idx += 2;
+        }
+    }
 
     icmp->checksum = htons(icmp_checksum(icmp, sizeof(pkt) - sizeof(iphdr)));
 

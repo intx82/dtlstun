@@ -65,7 +65,7 @@ struct ip_addr_hash {
 struct routing_entry_t {
     io_t::endpoint_t ep;
     io_t *iface{nullptr};
-    bool local;
+    int32_t prio;
 };
 
 class routing_t : public std::unordered_map<ip_addr_t, routing_entry_t, ip_addr_hash>
@@ -99,6 +99,9 @@ class routing_t : public std::unordered_map<ip_addr_t, routing_entry_t, ip_addr_
 
     static uint16_t icmp_checksum(const void *data, std::size_t len);
 
+    void icmp_advert_process(const io_t::endpoint_t &from, const uint8_t *pkt, size_t len, io_t &ingress);
+    void add_route(ip_addr_t &src, const io_t::endpoint_t &from, io_t &ingress, int32_t prio);
+
     void timer_loop();
     void on_tick();
 
@@ -127,6 +130,7 @@ class routing_t : public std::unordered_map<ip_addr_t, routing_entry_t, ip_addr_
     static constexpr uint8_t vers_nibble_ = 0xF;
     static constexpr uint8_t type_announce_ = 0x01;
     static constexpr uint8_t type_bye_ = 0x02;
+    static constexpr uint8_t ipv4_version = 4;
     static constexpr uint8_t ipv4_broadcast[4] = {0xff, 0xff, 0xff, 0xff};
 
     int efd_{-1};
