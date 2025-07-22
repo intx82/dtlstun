@@ -277,10 +277,9 @@ void routing_t::add_route(ip_addr_t &src, const io_t::endpoint_t &from, io_t &in
         std::unique_lock lk(mu_);
         auto it = find(src);
         if (it == end()) {
-            spdlog::warn("routing: Add new route: {} via {}:{} prio: {}", src.to_string(), from.host, from.port, prio);
+            spdlog::info("routing: Add new route: {} via {}:{} prio: {}", src.to_string(), from.host, from.port, prio);
             (*this)[src] = routing_entry_t{from, &ingress, 0};
         } else if ((*this)[src].prio <= prio) {
-            spdlog::warn("routing: Replace route: {} via {}:{} prio: {} old-prio: {}", src.to_string(), from.host, from.port, prio, (*this)[src].prio);
             (*this)[src] = routing_entry_t{from, &ingress, prio};
         }
     }
