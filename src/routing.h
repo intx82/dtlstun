@@ -51,6 +51,13 @@ struct ip_addr_t {
     static std::optional<ip_addr_t> parse(const std::string &txt);
 
     std::string to_string() const;
+
+    uint32_t ipv4() const {
+        if (len == 4) {
+            return buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
+        }
+        return 0;
+    }
 };
 
 struct ip_addr_hash {
@@ -79,7 +86,7 @@ class routing_t : public std::unordered_map<ip_addr_t, routing_entry_t, ip_addr_
     void register_local_io(io_t *tun_iface, const ip_addr_t &my_ip);
     void stop();
 
-    explicit routing_t();
+    explicit routing_t(uint8_t ipv4_cidr = 24);
 
     ~routing_t();
 
@@ -101,6 +108,7 @@ class routing_t : public std::unordered_map<ip_addr_t, routing_entry_t, ip_addr_
 
     void icmp_advert_process(const io_t::endpoint_t &from, const uint8_t *pkt, size_t len, io_t &ingress);
     void add_route(ip_addr_t &src, const io_t::endpoint_t &from, io_t &ingress, int32_t prio);
+    void route_nat(const ip_addr_t &dst, const io_t::endpoint_t &from, const uint8_t *pkt, size_t len, const io_t &ingress) const;
 
     void timer_loop();
     void on_tick();
@@ -127,12 +135,10 @@ class routing_t : public std::unordered_map<ip_addr_t, routing_entry_t, ip_addr_
         this->handle_datagram(from, d, n, iface);
     };
 
-    static constexpr uint8_t vers_nibble_ = 0xF;
-    static constexpr uint8_t type_announce_ = 0x01;
-    static constexpr uint8_t type_bye_ = 0x02;
     static constexpr uint8_t ipv4_version = 4;
     static constexpr uint8_t ipv4_broadcast[4] = {0xff, 0xff, 0xff, 0xff};
 
+    uint8_t cidr_{24};
     int efd_{-1};
     int timer_fd_{-1};
     std::thread thr_;

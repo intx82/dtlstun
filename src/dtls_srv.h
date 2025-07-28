@@ -144,17 +144,22 @@ class dtls_server_t : public io_t
             uint8_t buf[16384];
             int n = SSL_read(s->ssl, buf, sizeof(buf));
             if (n <= 0) {
-                int err = SSL_get_error(s->ssl, n);
-                if (err != SSL_ERROR_WANT_READ &&
-                    err != SSL_ERROR_WANT_WRITE &&
-                    err != SSL_ERROR_ZERO_RETURN) {
-                    print_ssl_error("SSL_read");
-                }
+                if (s->ssl) {
+                    int err = SSL_get_error(s->ssl, n);
+                    if (err != SSL_ERROR_WANT_READ &&
+                        err != SSL_ERROR_WANT_WRITE &&
+                        err != SSL_ERROR_ZERO_RETURN) {
+                        print_ssl_error("SSL_read");
+                    }
 
-                if (SSL_get_shutdown(s->ssl) & SSL_RECEIVED_SHUTDOWN) {
+                    if (SSL_get_shutdown(s->ssl) & SSL_RECEIVED_SHUTDOWN) {
+                        std::lock_guard<std::recursive_mutex> lg(mu_);
+                        close_and_erase(from, sessions_.find(key(from))->second);
+                        return;
+                    }
+                } else {
                     std::lock_guard<std::recursive_mutex> lg(mu_);
                     close_and_erase(from, sessions_.find(key(from))->second);
-                    return;
                 }
                 break;
             }

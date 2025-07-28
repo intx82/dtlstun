@@ -40,7 +40,7 @@ std::string ip_addr_t::to_string() const
     return "Unknown IP";
 }
 
-routing_t::routing_t() : running_(true)
+routing_t::routing_t(uint8_t ipv4_cidr) : cidr_(ipv4_cidr), running_(true)
 {
     efd_ = epoll_create1(EPOLL_CLOEXEC);
     timer_fd_ = timerfd_create(CLOCK_MONOTONIC,
@@ -158,6 +158,23 @@ void routing_t::register_local_io(io_t *iface, const ip_addr_t &my_ip)
     (*this)[my_ip] = routing_entry_t{{}, iface, 1};
 }
 
+void routing_t::route_nat(const ip_addr_t &dst, const io_t::endpoint_t &from, const uint8_t *pkt, size_t len, const io_t &ingress) const
+{
+    auto dst_route_iter = std::begin(*this);
+    size_t idx = htonl(dst.ipv4()) % this->size();
+    std::advance(dst_route_iter, idx);
+
+    if ((std::get<1>(*dst_route_iter).iface == &ingress) && (std::get<1>(*dst_route_iter).ep == from)) {
+        dst_route_iter = std::begin(*this);
+        std::advance(dst_route_iter, idx == (this->size() - 1) ? idx - 1 : idx + 1);
+    }
+
+    const routing_entry_t &dst_route = std::get<1>(*dst_route_iter);
+    spdlog::debug("routing: NAT route to {} - {}", dst.to_string(), std::get<0>(*dst_route_iter).to_string());
+    dst_route.iface->write(dst_route.ep, pkt, len);
+}
+
+
 void routing_t::handle_datagram(const io_t::endpoint_t &from, const uint8_t *pkt, size_t len, io_t &ingress)
 {
     uint8_t ver = reinterpret_cast<const iphdr *>(pkt)->version;
@@ -203,6 +220,31 @@ void routing_t::handle_datagram(const io_t::endpoint_t &from, const uint8_t *pkt
         if ((dst.buf[0] >= 224) && (dst.buf[0] <= 239)) {
             broadcast(pkt, len, &from);
             return;
+        }
+
+        uint32_t netmask = (1 << cidr_) - 1;
+        uint32_t my_ip_net = my_ip_.ipv4() & netmask;
+        uint32_t dst_ip_net = dst.ipv4() & netmask;
+
+        if (my_ip_net != dst_ip_net) {
+            if (&ingress == tun_iface_) {
+                if (server_iface_ == nullptr) {
+                    spdlog::debug("routing: NAT. to upper server");
+                    client_iface_->write({}, pkt, len);
+                    return;
+                } else {
+                    route_nat(dst, from, pkt, len, ingress);
+                    return;
+                }
+            } else {
+                if (server_iface_ == nullptr) {
+                    spdlog::debug("routing: NAT. to local TUN");
+                    tun_iface_->write({}, pkt, len);
+                    return;
+                } else {
+                    route_nat(dst, from, pkt, len, ingress);
+                }
+            }
         }
 
         {
